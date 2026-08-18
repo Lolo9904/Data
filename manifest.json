@@ -1,0 +1,14 @@
+{
+  "name": "Paddock · Telemetría",
+  "short_name": "Paddock",
+  "description": "Análisis de telemetría de kart/quad",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#0B0E14",
+  "theme_color": "#0B0E14",
+  "icons": [
+    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
