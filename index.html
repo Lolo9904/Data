@@ -34,7 +34,7 @@
 const { useState, useMemo, useRef, useCallback, useEffect } = React;
 const {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
-  ReferenceLine, ReferenceArea, ScatterChart, Scatter, ZAxis, Cell,
+  ReferenceLine, ReferenceArea, ReferenceDot, ScatterChart, Scatter, ZAxis, Cell,
 } = Recharts;
 
 
@@ -244,24 +244,36 @@ function Channel({ title, unit, series, color, colorB, cursor, onCursor, domain,
   const [refL, setRefL] = React.useState(null);
   const [refR, setRefR] = React.useState(null);
   const dragging = refL != null;
-  const down = (e) => { if (e && e.activeLabel != null) { setRefL(e.activeLabel); setRefR(e.activeLabel); } };
+  const down = (e) => {
+    if (e && e.activeLabel != null) {
+      setRefL(e.activeLabel); setRefR(null);
+      if (e.activeTooltipIndex != null && onCursor) onCursor(e.activeTooltipIndex / (series.length - 1)); // mueve cursor al tocar
+    }
+  };
   const move = (e) => {
     if (!e) return;
-    if (dragging) setRefR(e.activeLabel);
-    else if (e.activeTooltipIndex != null && onCursor) onCursor(e.activeTooltipIndex / (series.length - 1));
+    if (refL != null) setRefR(e.activeLabel);                 // arrastrando: marca zona de posible zoom
+    if (e.activeTooltipIndex != null && onCursor) onCursor(e.activeTooltipIndex / (series.length - 1)); // cursor sigue el dedo
   };
   const up = () => {
-    if (refL != null && refR != null && Math.abs(refR - refL) > 1e-6 && onZoom) {
-      onZoom([Math.min(refL, refR), Math.max(refL, refR)]);
+    if (refL != null && refR != null && onZoom && series.length > 1) {
+      const range = Math.abs(series[series.length - 1].d - series[0].d) || 1;
+      if (Math.abs(refR - refL) > range * 0.03)              // solo zoom si el arrastre cubre > 3% del eje
+        onZoom([Math.min(refL, refR), Math.max(refL, refR)]);
     }
     setRefL(null); setRefR(null);
   };
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "8px 10px 4px", touchAction: "pan-y" }}>
-      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.dim, fontFamily: "monospace", marginBottom: 2 }}>
-        <span style={{ letterSpacing: 1, textTransform: "uppercase" }}>{title}</span>
-        <span>{curIdx != null && series[curIdx]
-          ? `${series[curIdx].a?.toFixed(unit === "°" ? 0 : 1)} ${unit}` : unit}</span>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 2 }}>
+        <span style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, textTransform: "uppercase" }}>{title}</span>
+        <span style={{ fontFamily: "monospace", fontSize: 18, fontWeight: 700 }}>
+          {curIdx != null && series[curIdx] ? <>
+            <span style={{ color }}>{series[curIdx].a?.toFixed(unit === "°" ? 0 : 1)}</span>
+            {colorB && series[curIdx].b != null && <span style={{ color: colorB, fontSize: 13, marginLeft: 8 }}>{series[curIdx].b?.toFixed(unit === "°" ? 0 : 1)}</span>}
+            <span style={{ color: C.dim, fontSize: 12, marginLeft: 4 }}>{unit}</span>
+          </> : <span style={{ color: C.dim, fontSize: 12 }}>{unit}</span>}
+        </span>
       </div>
       <ResponsiveContainer width="100%" height={height}>
         <LineChart data={series} margin={{ top: 4, right: 6, left: -18, bottom: showX ? 2 : 0 }}
@@ -274,8 +286,9 @@ function Channel({ title, unit, series, color, colorB, cursor, onCursor, domain,
           <Tooltip contentStyle={{ display: "none" }} />
           {colorB && <Line dataKey="b" stroke={colorB} dot={false} strokeWidth={1.4} strokeOpacity={0.7} isAnimationActive={false} />}
           <Line dataKey="a" stroke={color} dot={false} strokeWidth={1.8} isAnimationActive={false} />
-          {curIdx != null && !dragging && <ReferenceLine x={series[curIdx]?.d} stroke={C.text} strokeWidth={1} />}
-          {dragging && refR != null && <ReferenceArea x1={refL} x2={refR} fill={C.A} fillOpacity={0.15} />}
+          {curIdx != null && <ReferenceLine x={series[curIdx]?.d} stroke={C.text} strokeWidth={1} />}
+          {curIdx != null && series[curIdx] && <ReferenceDot x={series[curIdx].d} y={series[curIdx].a} r={4} fill={color} stroke={C.bg} strokeWidth={1.5} isFront />}
+          {refL != null && refR != null && refL !== refR && <ReferenceArea x1={refL} x2={refR} fill={C.A} fillOpacity={0.15} />}
         </LineChart>
       </ResponsiveContainer>
     </div>
@@ -579,7 +592,7 @@ function Shell({ children, page, setPage, onFile, fileName, hasData }) {
   );
   return (
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "system-ui, sans-serif" }}>
-      <header style={{ display: "flex", alignItems: "center", gap: 22, padding: "12px 18px", borderBottom: `1px solid ${C.line}`, position: "sticky", top: 0, background: C.bg, zIndex: 5 }}>
+      <header style={{ display: "flex", alignItems: "center", gap: 22, padding: "12px 18px", paddingTop: "calc(12px + env(safe-area-inset-top))", paddingLeft: "calc(18px + env(safe-area-inset-left))", paddingRight: "calc(18px + env(safe-area-inset-right))", borderBottom: `1px solid ${C.line}`, position: "sticky", top: 0, background: C.bg, zIndex: 5 }}>
         <div style={{ fontFamily: "monospace", fontWeight: 800, letterSpacing: 1, color: C.A }}>◢ PADDOCK</div>
         {hasData && <nav style={{ display: "flex", gap: 18 }}>{tab("overview", "Vueltas")}{tab("analysis", "Análisis")}{tab("config", "Calibración")}</nav>}
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
@@ -596,8 +609,6 @@ function Shell({ children, page, setPage, onFile, fileName, hasData }) {
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
 </script>
-
-<!-- Service worker (solo si se sirve por http/https; da modo offline) -->
 <script>
 if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
   window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(()=>{}));
