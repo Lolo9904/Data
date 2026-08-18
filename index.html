@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+<title>Paddock · Telemetría</title>
+<meta name="theme-color" content="#0B0E14" />
+<!-- PWA iOS -->
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Paddock" />
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icon-192.png" />
+<style>
+  html,body{margin:0;padding:0;background:#0B0E14;color:#E4E8F0;
+    font-family:system-ui,-apple-system,sans-serif;
+    -webkit-text-size-adjust:100%;-webkit-tap-highlight-color:transparent;overscroll-behavior:none;}
+  *{box-sizing:border-box;}
+  #root{min-height:100vh;}
+  .boot{display:flex;align-items:center;justify-content:center;height:100vh;color:#7C8798;font-family:monospace;}
+</style>
+<!-- Librerias (CDN). Tras la 1a carga quedan en cache del navegador. -->
+<script crossorigin src="https://unpkg.com/react@18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/prop-types@15.8.1/prop-types.min.js"></script>
+<script crossorigin src="https://unpkg.com/recharts@2.12.7/umd/Recharts.js"></script>
+<script src="https://unpkg.com/papaparse@5.4.1/papaparse.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone@7.24.7/babel.min.js"></script>
+</head>
+<body>
+<div id="root"><div class="boot">Cargando Paddock…</div></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef, useCallback, useEffect } = React;
+const {
+  LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  ReferenceLine, ReferenceArea, ScatterChart, Scatter, ZAxis, Cell,
+} = Recharts;
+
+
+/* ============================================================
+   PALETA (instrumento de telemetria)
+   ============================================================ */
+const C = {
+  bg: "#0B0E14", panel: "#141922", line: "#232B38", text: "#E4E8F0",
+  dim: "#7C8798", A: "#22D3EE", B: "#F5A524",
+  gain: "#2DD4A7", loss: "#FB6E6E", best: "#A78BFA", grid: "#1C2430",
+};
+
+/* ============================================================
+   UTILIDADES
+   ============================================================ */
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function haversine(la1, lo1, la2, lo2) {
+  const R = 6371000, r = Math.PI / 180;
+  const dLa = (la2 - la1) * r, dLo = (lo2 - lo1) * r;
+  const a = Math.sin(dLa / 2) ** 2 +
+    Math.cos(la1 * r) * Math.cos(la2 * r) * Math.sin(dLo / 2) ** 2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
+
+// interpola y en x dentro de arrays ordenados por xs
+function interp(xs, ys, x) {
+  if (x <= xs[0]) return ys[0];
+  if (x >= xs[xs.length - 1]) return ys[ys.length - 1];
+  let lo = 0, hi = xs.length - 1;
+  while (hi - lo > 1) { const m = (lo + hi) >> 1; if (xs[m] < x) lo = m; else hi = m; }
+  const t = (x - xs[lo]) / (xs[hi] - xs[lo] || 1);
+  return ys[lo] + t * (ys[hi] - ys[lo]);
+}
+
+function fmtLap(s) {
+  if (!s || s <= 0) return "--:--.---";
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60), ms = Math.round((s - Math.floor(s)) * 1000);
+  return `${m}:${String(sec).padStart(2, "0")}.${String(ms).padStart(3, "0")}`;
+}
+function fmtDelta(d) {
+  if (d == null || isNaN(d)) return "";
+  return (d >= 0 ? "+" : "") + d.toFixed(3);
+}
+
+/* ============================================================
+   PARSEO + DETECCION DE VUELTAS
+   ============================================================ */
+function buildDataset(rows) {
+  const num = (v) => { const n = parseFloat(v); return Number.isFinite(n) ? n : 0; };
+  const data = rows.map((r) => ({
+    t: num(r.Time), lat: num(r.Lat), lon: num(r.Lon), speed: num(r.Speed), fix: num(r.Fix),
+    ax: num(r.Ax), ay: num(r.Ay), az: num(r.Az), gx: num(r.Gx), gy: num(r.Gy), gz: num(r.Gz),
+    // canales ADC: solo existen en el formato nuevo (22 col). Si faltan -> 0.
+    gas: num(r.Gas), brake: num(r.Brake), steer: num(r.Steer), temp: num(r.TempC),
+    lap: num(r.Lap), ev: num(r.Ev), lapTime: num(r.LapTime),
+    hasADC: r.Gas !== undefined && r.Steer !== undefined,
+  })).filter((d) => Number.isFinite(d.t) && (d.t !== 0 || rows.length < 3));
+
+  const hasADC = data.length ? data[0].hasADC : false;
+
+  const closes = [];
+  data.forEach((d, i) => { if (d.ev === 2 && d.lapTime > 0) closes.push({ idx: i, lap: d.lap, time: d.lapTime }); });
+
+  const laps = [];
+  closes.forEach((c) => {
+    const endT = data[c.idx].t;
+    const targetT = endT - c.time * 1000;      // inicio real = cierre - tiempo de vuelta
+    let s = 0;
+    for (let i = c.idx; i >= 0; i--) { if (data[i].t <= targetT) { s = i; break; } }
+    laps.push({ num: c.lap, time: c.time, start: s, end: c.idx });
+  });
+  return { data, laps, hasADC };
+}
+
+/* ============================================================
+   CALIBRACION
+   ============================================================ */
+const defaultCal = () => ({
+  gas: { min: 0, max: 4095 },
+  brake: { min: 0, max: 4095 },
+  steer: { left: 0, center: 2048, right: 4095, maxAngle: 90 },
+  imu: { long: "ax", lat: "ay", rot: 0, invLong: false, invLat: false },
+});
+
+function autoCal(data) {
+  const col = (k) => data.map((d) => d[k]).filter(Number.isFinite).sort((a, b) => a - b);
+  const pct = (arr, p) => arr[clamp(Math.floor(arr.length * p), 0, arr.length - 1)] || 0;
+  const g = col("gas"), b = col("brake"), s = col("steer");
+  return {
+    gas: { min: pct(g, 0.01), max: pct(g, 0.99) },
+    brake: { min: pct(b, 0.01), max: pct(b, 0.99) },
+    steer: { left: pct(s, 0.01), center: pct(s, 0.5), right: pct(s, 0.99), maxAngle: 90 },
+    imu: defaultCal().imu,
+  };
+}
+
+const toGas = (raw, c) => clamp(((raw - c.gas.min) / (c.gas.max - c.gas.min || 1)) * 100, 0, 100);
+const toBrake = (raw, c) => clamp(((raw - c.brake.min) / (c.brake.max - c.brake.min || 1)) * 100, 0, 100);
+function toSteer(raw, c) {
+  const s = c.steer;
+  if (raw <= s.center) return -clamp((s.center - raw) / (s.center - s.left || 1), 0, 1) * s.maxAngle;
+  return clamp((raw - s.center) / (s.right - s.center || 1), 0, 1) * s.maxAngle;
+}
+// aceleraciones long/lat corregidas por montaje (rotacion en el plano)
+function accelLL(d, c) {
+  const map = { ax: d.ax, ay: d.ay, az: d.az };
+  let lo = map[c.imu.long] * (c.imu.invLong ? -1 : 1);
+  let la = map[c.imu.lat] * (c.imu.invLat ? -1 : 1);
+  const r = (c.imu.rot * Math.PI) / 180;
+  return { lon: lo * Math.cos(r) - la * Math.sin(r), lat: lo * Math.sin(r) + la * Math.cos(r) };
+}
+
+/* ============================================================
+   GEOMETRIA DE VUELTA (distancia, tiempo, proyeccion)
+   ============================================================ */
+function lapGeom(data, lap) {
+  const seg = data.slice(lap.start, lap.end + 1).filter((d) => d.fix === 1 && d.lat !== 0);
+  if (seg.length < 2) return null;
+  const dist = [0]; let acc = 0;
+  for (let i = 1; i < seg.length; i++) { acc += haversine(seg[i - 1].lat, seg[i - 1].lon, seg[i].lat, seg[i].lon); dist.push(acc); }
+  const total = acc || 1;
+  const distN = dist.map((x) => x / total);
+  const t0 = seg[0].t;
+  const trel = seg.map((d) => (d.t - t0) / 1000);
+  return { seg, dist, distN, total, trel };
+}
+
+/* delta-t: tiempo A - tiempo B remuestreado a la distancia de A */
+function computeDelta(gA, gB) {
+  if (!gA || !gB) return null;
+  return gA.distN.map((dn, i) => gA.trel[i] - interp(gB.distN, gB.trel, dn));
+}
+
+/* proyeccion equirectangular a viewbox [W,H] con padding */
+function projector(pts, W, H, pad = 16) {
+  const lats = pts.map((p) => p.lat), lons = pts.map((p) => p.lon);
+  const laMin = Math.min(...lats), laMax = Math.max(...lats);
+  const loMin = Math.min(...lons), loMax = Math.max(...lons);
+  const la0 = (laMin + laMax) / 2;
+  const kx = Math.cos((la0 * Math.PI) / 180);
+  const w = (loMax - loMin) * kx || 1e-6, h = (laMax - laMin) || 1e-6;
+  const sc = Math.min((W - 2 * pad) / w, (H - 2 * pad) / h);
+  const ox = (W - w * sc) / 2, oy = (H - h * sc) / 2;
+  return (p) => ({
+    x: ox + ((p.lon - loMin) * kx) * sc,
+    y: H - (oy + ((p.lat - laMin)) * sc), // norte arriba
+  });
+}
+
+/* ============================================================
+   MAPA GPS (traza; interactivo opcional; color por delta)
+   ============================================================ */
+function GPSMap({ gA, gB, delta, cursor, onPick, W = 560, H = 380, interactive = true, heightCss = null }) {
+  const svgRef = useRef(null);
+  if (!gA) return <Empty msg="Sin datos GPS con fix en esta vuelta." />;
+
+  const proj = useMemo(() => projector(gA.seg, W, H), [gA, W, H]);
+  const ptsA = useMemo(() => gA.seg.map(proj), [gA, proj]);
+  const ptsB = useMemo(() => (gB ? gB.seg.map(projector(gB.seg, W, H)) : null), [gB, W, H]);
+
+  // color de cada segmento de A por la PENDIENTE del delta (ganas/pierdes)
+  const segColors = useMemo(() => {
+    if (!delta) return null;
+    return delta.map((_, i) => {
+      if (i === 0) return C.dim;
+      const slope = delta[i] - delta[i - 1]; // sube => A pierde tiempo aqui
+      if (slope > 0.0005) return C.loss;
+      if (slope < -0.0005) return C.gain;
+      return C.dim;
+    });
+  }, [delta]);
+
+  const handleClick = useCallback((e) => {
+    if (!interactive || !onPick) return;
+    const rect = svgRef.current.getBoundingClientRect();
+    const x = ((e.clientX - rect.left) / rect.width) * W;
+    const y = ((e.clientY - rect.top) / rect.height) * H;
+    let best = 0, bd = Infinity;
+    ptsA.forEach((p, i) => { const dd = (p.x - x) ** 2 + (p.y - y) ** 2; if (dd < bd) { bd = dd; best = i; } });
+    onPick(best / (ptsA.length - 1));
+  }, [interactive, onPick, ptsA, W, H]);
+
+  const cur = cursor != null ? ptsA[clamp(Math.round(cursor * (ptsA.length - 1)), 0, ptsA.length - 1)] : null;
+
+  return (
+    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} width="100%" onClick={handleClick}
+      style={{ cursor: interactive ? "crosshair" : "default", background: C.bg, borderRadius: 8, touchAction: "manipulation", height: heightCss || "auto", display: "block" }}>
+      {ptsB && <polyline fill="none" stroke={C.B} strokeOpacity="0.35" strokeWidth="2"
+        points={ptsB.map((p) => `${p.x},${p.y}`).join(" ")} />}
+      {segColors
+        ? ptsA.slice(1).map((p, i) => (
+            <line key={i} x1={ptsA[i].x} y1={ptsA[i].y} x2={p.x} y2={p.y}
+              stroke={segColors[i + 1]} strokeWidth="3.5" strokeLinecap="round" />))
+        : <polyline fill="none" stroke={C.A} strokeWidth="3" points={ptsA.map((p) => `${p.x},${p.y}`).join(" ")} />}
+      {cur && <circle cx={cur.x} cy={cur.y} r="6" fill={C.text} stroke={C.bg} strokeWidth="2" />}
+      {ptsA[0] && <circle cx={ptsA[0].x} cy={ptsA[0].y} r="4" fill={C.best} />}
+    </svg>
+  );
+}
+
+/* ============================================================
+   GRAFICA DE CANAL (recharts, cursor sincronizado)
+   ============================================================ */
+function Channel({ title, unit, series, color, colorB, cursor, onCursor, domain, height = 120, showX = false, xUnit = "", xDomain, onZoom }) {
+  const curIdx = cursor != null ? Math.round(cursor * (series.length - 1)) : null;
+  const [refL, setRefL] = React.useState(null);
+  const [refR, setRefR] = React.useState(null);
+  const dragging = refL != null;
+  const down = (e) => { if (e && e.activeLabel != null) { setRefL(e.activeLabel); setRefR(e.activeLabel); } };
+  const move = (e) => {
+    if (!e) return;
+    if (dragging) setRefR(e.activeLabel);
+    else if (e.activeTooltipIndex != null && onCursor) onCursor(e.activeTooltipIndex / (series.length - 1));
+  };
+  const up = () => {
+    if (refL != null && refR != null && Math.abs(refR - refL) > 1e-6 && onZoom) {
+      onZoom([Math.min(refL, refR), Math.max(refL, refR)]);
+    }
+    setRefL(null); setRefR(null);
+  };
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "8px 10px 4px", touchAction: "pan-y" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: C.dim, fontFamily: "monospace", marginBottom: 2 }}>
+        <span style={{ letterSpacing: 1, textTransform: "uppercase" }}>{title}</span>
+        <span>{curIdx != null && series[curIdx]
+          ? `${series[curIdx].a?.toFixed(unit === "°" ? 0 : 1)} ${unit}` : unit}</span>
+      </div>
+      <ResponsiveContainer width="100%" height={height}>
+        <LineChart data={series} margin={{ top: 4, right: 6, left: -18, bottom: showX ? 2 : 0 }}
+          onMouseDown={down} onMouseMove={move} onMouseUp={up} onMouseLeave={up}>
+          <CartesianGrid stroke={C.grid} vertical={false} />
+          <XAxis dataKey="d" type="number" domain={xDomain || ["dataMin", "dataMax"]} allowDataOverflow hide={!showX}
+            tick={{ fill: C.dim, fontSize: 10, fontFamily: "monospace" }}
+            tickFormatter={(v) => (xUnit === "s" ? v.toFixed(0) : Math.round(v))} height={showX ? 18 : 0} />
+          <YAxis domain={domain} tick={{ fill: C.dim, fontSize: 10, fontFamily: "monospace" }} width={34} />
+          <Tooltip contentStyle={{ display: "none" }} />
+          {colorB && <Line dataKey="b" stroke={colorB} dot={false} strokeWidth={1.4} strokeOpacity={0.7} isAnimationActive={false} />}
+          <Line dataKey="a" stroke={color} dot={false} strokeWidth={1.8} isAnimationActive={false} />
+          {curIdx != null && !dragging && <ReferenceLine x={series[curIdx]?.d} stroke={C.text} strokeWidth={1} />}
+          {dragging && refR != null && <ReferenceArea x1={refL} x2={refR} fill={C.A} fillOpacity={0.15} />}
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+/* ============================================================
+   DIAGRAMA G-G
+   ============================================================ */
+function GGDiagram({ gA, data, cal, cursor }) {
+  const pts = useMemo(() => {
+    if (!gA) return [];
+    return gA.seg.map((d, i) => { const a = accelLL(d, cal); return { x: a.lat, y: a.lon, i }; })
+      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+  }, [gA, cal]);
+  const lim = 2.5;
+  const curPt = cursor != null && pts.length ? pts[clamp(Math.round(cursor * (pts.length - 1)), 0, pts.length - 1)] : null;
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 10 }}>
+      <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>DIAGRAMA G-G (g)</div>
+      <ResponsiveContainer width="100%" height={260}>
+        <ScatterChart margin={{ top: 6, right: 6, bottom: 6, left: -6 }}>
+          <CartesianGrid stroke={C.grid} />
+          <XAxis type="number" dataKey="x" domain={[-lim, lim]} tick={{ fill: C.dim, fontSize: 10 }} name="lateral" />
+          <YAxis type="number" dataKey="y" domain={[-lim, lim]} tick={{ fill: C.dim, fontSize: 10 }} name="long" />
+          <ReferenceLine x={0} stroke={C.line} /><ReferenceLine y={0} stroke={C.line} />
+          <Scatter data={pts} fill={C.A} fillOpacity={0.35} isAnimationActive={false} />
+          {curPt && <Scatter data={[curPt]} fill={C.text} isAnimationActive={false} />}
+        </ScatterChart>
+      </ResponsiveContainer>
+      <div style={{ fontSize: 10, color: C.dim, textAlign: "center" }}>← lateral →  ·  ↑ acelera / ↓ frena</div>
+    </div>
+  );
+}
+
+/* ============================================================
+   PANELES DE UI
+   ============================================================ */
+const Empty = ({ msg }) => <div style={{ color: C.dim, fontSize: 13, padding: 30, textAlign: "center" }}>{msg}</div>;
+
+function LapRow({ lap, best, isA, isB, onA, onB }) {
+  const isBest = lap.time === best;
+  return (
+    <div style={{ display: "grid", gridTemplateColumns: "38px 1fr 62px 62px", alignItems: "center", gap: 6,
+      padding: "6px 8px", borderBottom: `1px solid ${C.line}`, fontFamily: "monospace", fontSize: 13 }}>
+      <span style={{ color: isBest ? C.best : C.dim }}>{isBest ? "★" : "L"}{lap.num}</span>
+      <span style={{ color: isBest ? C.best : C.text, fontSize: 15 }}>{fmtLap(lap.time)}</span>
+      <button onClick={onA} style={btn(isA ? C.A : null)}>A</button>
+      <button onClick={onB} style={btn(isB ? C.B : null)}>B</button>
+    </div>
+  );
+}
+const btn = (on) => ({
+  background: on ? on : "transparent", color: on ? C.bg : C.dim,
+  border: `1px solid ${on || C.line}`, borderRadius: 5, padding: "3px 0", cursor: "pointer",
+  fontFamily: "monospace", fontWeight: 700, fontSize: 12,
+});
+
+function CalField({ label, value, onChange }) {
+  return (
+    <label style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12, color: C.dim, marginBottom: 6 }}>
+      {label}
+      <input type="number" value={value} onChange={(e) => onChange(+e.target.value)}
+        style={{ width: 90, background: C.bg, color: C.text, border: `1px solid ${C.line}`, borderRadius: 5, padding: "4px 6px", fontFamily: "monospace", textAlign: "right" }} />
+    </label>
+  );
+}
+
+/* ============================================================
+   APP
+   ============================================================ */
+function App() {
+  const [ds, setDs] = useState(null);          // { data, laps }
+  const [cal, setCal] = useState(() => { try { const s = localStorage.getItem('paddock_cal'); return s ? JSON.parse(s) : defaultCal(); } catch(e){ return defaultCal(); } });
+  const [page, setPage] = useState("overview");
+  const [aIdx, setAIdx] = useState(0);
+  const [bIdx, setBIdx] = useState(1);
+  const [cursor, setCursor] = useState(null);   // 0..1 sobre vuelta A
+  const [xMode, setXMode] = useState("dist");   // eje X: 'dist' (m) | 'time' (s)
+  const [xZoom, setXZoom] = useState(null);     // [min,max] del eje X o null
+  const [fileName, setFileName] = useState("");
+  useEffect(() => { try { localStorage.setItem("paddock_cal", JSON.stringify(cal)); } catch(e){} }, [cal]);
+
+  const onFile = (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    setFileName(f.name);
+    const reader = new FileReader();
+    reader.onload = (ev) => {
+      // normaliza saltos de linea (Windows \r\n / Mac \r) -> \n, evita que PapaParse los junte
+      const text = String(ev.target.result).replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+      const res = Papa.parse(text, {
+        header: true, dynamicTyping: false, skipEmptyLines: true,
+        transformHeader: (h) => h.trim(),
+      });
+      const built = buildDataset(res.data);
+      setDs(built);
+      setAIdx(0); setBIdx(built.laps.length > 1 ? 1 : 0); setCursor(null);
+    };
+    reader.readAsText(f);
+  };
+
+  const laps = ds?.laps || [];
+  const best = laps.length ? Math.min(...laps.map((l) => l.time)) : 0;
+  const gA = useMemo(() => (ds && laps[aIdx] ? lapGeom(ds.data, laps[aIdx]) : null), [ds, aIdx]);
+  const gB = useMemo(() => (ds && laps[bIdx] && bIdx !== aIdx ? lapGeom(ds.data, laps[bIdx]) : null), [ds, bIdx, aIdx]);
+  const delta = useMemo(() => computeDelta(gA, gB), [gA, gB]);
+  const finalDelta = delta ? delta[delta.length - 1] : null;
+
+  // series para graficas. Muestreo por distancia normalizada (alinea A y B espacialmente);
+  // el eje X muestra distancia real (m) o tiempo de A (s) segun xMode.
+  const series = useMemo(() => {
+    if (!gA) return null;
+    const N = Math.min(600, gA.seg.length);
+    // valor del eje X en cada punto (0..1 -> m o s)
+    const xVal = (dn) => xMode === "time" ? interp(gA.distN, gA.trel, dn) : dn * gA.total;
+    const pick = (g, conv) => {
+      if (!g) return null;
+      const xs = g.distN, ys = g.seg.map((d) => conv(d));
+      return (dn) => interp(xs, ys, dn);
+    };
+    const mk = (conv) => {
+      const fa = pick(gA, conv), fb = pick(gB, conv);
+      return Array.from({ length: N }, (_, i) => {
+        const dn = i / (N - 1);
+        return { d: xVal(dn), f: dn, a: fa(dn), b: fb ? fb(dn) : null };
+      });
+    };
+    return {
+      xMax: xVal(1),
+      speed: mk((d) => d.speed),
+      gas: mk((d) => toGas(d.gas, cal)),
+      brake: mk((d) => toBrake(d.brake, cal)),
+      steer: mk((d) => toSteer(d.steer, cal)),
+      deltaLine: (() => {
+        if (!delta) return null;
+        return Array.from({ length: N }, (_, i) => { const dn = i / (N - 1); return { d: xVal(dn), f: dn, a: interp(gA.distN, delta, dn) }; });
+      })(),
+    };
+  }, [gA, gB, cal, delta, xMode]);
+
+  /* ---------- pantalla de carga ---------- */
+  if (!ds) {
+    return (
+      <Shell page={page} setPage={setPage} onFile={onFile} fileName={fileName} hasData={false}>
+        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "70vh", gap: 18 }}>
+          <div style={{ fontFamily: "monospace", fontSize: 13, color: C.dim, letterSpacing: 2 }}>PADDOCK · TELEMETRÍA</div>
+          <div style={{ fontSize: 30, fontWeight: 800, color: C.text, letterSpacing: -0.5 }}>Sube un log del datalogger</div>
+          <div style={{ color: C.dim, fontSize: 14, maxWidth: 460, textAlign: "center", lineHeight: 1.6 }}>
+            Un CSV <span style={{ color: C.A, fontFamily: "monospace" }}>GpsImuNex_N.csv</span>. Las vueltas se detectan solas por los eventos de meta.
+          </div>
+          <label style={{ ...btn(C.A), padding: "12px 26px", fontSize: 15, cursor: "pointer" }}>
+            Elegir archivo<input type="file" accept=".csv" onChange={onFile} style={{ display: "none" }} />
+          </label>
+        </div>
+      </Shell>
+    );
+  }
+
+  /* ---------- OVERVIEW ---------- */
+  const overview = (
+    <div style={{ display: "grid", gridTemplateColumns: "250px 1fr", gap: 14, alignItems: "start" }}>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, overflow: "hidden" }}>
+        <div style={{ padding: "10px 12px", fontFamily: "monospace", fontSize: 12, color: C.dim, letterSpacing: 1, borderBottom: `1px solid ${C.line}` }}>
+          VUELTAS · {laps.length}
+        </div>
+        {laps.length === 0 && <Empty msg="No hay vueltas cerradas en este log (¿marcaste meta?)." />}
+        {laps.map((l, i) => (
+          <LapRow key={i} lap={l} best={best} isA={i === aIdx} isB={i === bIdx}
+            onA={() => setAIdx(i)} onB={() => setBIdx(i)} />
+        ))}
+      </div>
+      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
+          <div style={{ fontFamily: "monospace", fontSize: 12, color: C.dim, letterSpacing: 1 }}>
+            <span style={{ color: C.A }}>A · L{laps[aIdx]?.num} {fmtLap(laps[aIdx]?.time)}</span>
+            {gB && <span style={{ color: C.B, marginLeft: 14 }}>B · L{laps[bIdx]?.num} {fmtLap(laps[bIdx]?.time)}</span>}
+          </div>
+          {finalDelta != null && (
+            <div style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 800, color: finalDelta <= 0 ? C.gain : C.loss }}>
+              {fmtDelta(finalDelta)}s
+            </div>
+          )}
+        </div>
+        <GPSMap gA={gA} gB={gB} delta={delta} cursor={cursor} onPick={(f) => { setCursor(f); }} W={900} H={620} heightCss="min(70vh, 640px)" />
+        <div style={{ display: "flex", gap: 16, marginTop: 8, fontSize: 11, fontFamily: "monospace", color: C.dim }}>
+          <span><span style={{ color: C.gain }}>▬</span> A gana</span>
+          <span><span style={{ color: C.loss }}>▬</span> A pierde</span>
+          <span><span style={{ color: C.B }}>▬</span> vuelta B</span>
+          <span style={{ marginLeft: "auto" }}>toca el mapa para fijar el punto →</span>
+        </div>
+      </div>
+    </div>
+  );
+
+  /* ---------- ANALISIS ---------- */
+  const analysis = (
+    <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: 14, alignItems: "start" }}>
+      <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, fontFamily: "monospace", color: C.dim }}>
+          <span>eje X:</span>
+          <button onClick={() => { setXMode("dist"); setXZoom(null); }} style={btn(xMode === "dist" ? C.A : null)}>Distancia (m)</button>
+          <button onClick={() => { setXMode("time"); setXZoom(null); }} style={btn(xMode === "time" ? C.A : null)}>Tiempo (s)</button>
+          {xZoom
+            ? <button onClick={() => setXZoom(null)} style={{ ...btn(C.loss), marginLeft: 8 }}>Reset zoom ✕</button>
+            : <span style={{ marginLeft: "auto", color: C.dim }}>arrastra sobre una gráfica para hacer zoom →</span>}
+        </div>
+        {series && <>
+          <Channel title="Velocidad" unit="km/h" series={series.speed} color={C.A} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, "auto"]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
+          {ds.hasADC ? <>
+            <Channel title="Acelerador" unit="%" series={series.gas} color={C.gain} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
+            <Channel title="Freno" unit="%" series={series.brake} color={C.loss} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
+            <Channel title="Dirección" unit="°" series={series.steer} color={C.best} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[-cal.steer.maxAngle, cal.steer.maxAngle]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
+          </> : (
+            <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 14px", fontSize: 12, color: C.dim }}>
+              Este log no incluye canales de pedales/dirección (formato antiguo). Velocidad, delta y G-G sí están disponibles.
+            </div>
+          )}
+          {series.deltaLine && <Channel title="Delta A−B (acumulado)" unit="s" series={series.deltaLine} color={C.text} cursor={cursor} onCursor={setCursor} domain={["auto", "auto"]} height={100} showX xUnit={xMode === "time" ? "s" : "m"}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
+        </>}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 12 }}>
+        <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 8 }}>
+          <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>MAPA (solo lectura)</div>
+          <GPSMap gA={gA} gB={gB} delta={delta} cursor={cursor} interactive={false} W={280} H={200} />
+        </div>
+        <GGDiagram gA={gA} data={ds.data} cal={cal} cursor={cursor} />
+      </div>
+    </div>
+  );
+
+  /* ---------- CONFIG ---------- */
+  const cfg = (label, obj, path) => (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 14 }}>
+      <div style={{ fontFamily: "monospace", fontSize: 13, color: C.text, letterSpacing: 1, marginBottom: 10 }}>{label}</div>
+      {obj}
+    </div>
+  );
+  const setCalPath = (grp, key, v) => setCal((c) => ({ ...c, [grp]: { ...c[grp], [key]: v } }));
+  const config = (
+    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(240px,1fr))", gap: 14 }}>
+      <button onClick={() => setCal(autoCal(ds.data))} style={{ ...btn(C.A), gridColumn: "1/-1", padding: "10px", fontSize: 14 }}>
+        Calibrar todo automáticamente (del log actual)
+      </button>
+      {cfg("ACELERADOR", <>
+        <CalField label="raw en 0 %" value={cal.gas.min} onChange={(v) => setCalPath("gas", "min", v)} />
+        <CalField label="raw en 100 %" value={cal.gas.max} onChange={(v) => setCalPath("gas", "max", v)} />
+      </>)}
+      {cfg("FRENO", <>
+        <CalField label="raw en 0 %" value={cal.brake.min} onChange={(v) => setCalPath("brake", "min", v)} />
+        <CalField label="raw en 100 %" value={cal.brake.max} onChange={(v) => setCalPath("brake", "max", v)} />
+      </>)}
+      {cfg("DIRECCIÓN", <>
+        <CalField label="raw izquierda" value={cal.steer.left} onChange={(v) => setCalPath("steer", "left", v)} />
+        <CalField label="raw centro (0°)" value={cal.steer.center} onChange={(v) => setCalPath("steer", "center", v)} />
+        <CalField label="raw derecha" value={cal.steer.right} onChange={(v) => setCalPath("steer", "right", v)} />
+        <CalField label="ángulo máx (±°)" value={cal.steer.maxAngle} onChange={(v) => setCalPath("steer", "maxAngle", v)} />
+      </>)}
+      {cfg("IMU · MONTAJE", <>
+        <label style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.dim, marginBottom: 6 }}>
+          eje longitudinal
+          <select value={cal.imu.long} onChange={(e) => setCalPath("imu", "long", e.target.value)} style={sel}>
+            <option value="ax">Ax</option><option value="ay">Ay</option><option value="az">Az</option>
+          </select>
+        </label>
+        <label style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.dim, marginBottom: 6 }}>
+          eje lateral
+          <select value={cal.imu.lat} onChange={(e) => setCalPath("imu", "lat", e.target.value)} style={sel}>
+            <option value="ay">Ay</option><option value="ax">Ax</option><option value="az">Az</option>
+          </select>
+        </label>
+        <label style={{ display: "block", fontSize: 12, color: C.dim, marginBottom: 4 }}>
+          rotación fina: {cal.imu.rot}°
+          <input type="range" min={-180} max={180} value={cal.imu.rot} onChange={(e) => setCalPath("imu", "rot", +e.target.value)} style={{ width: "100%" }} />
+        </label>
+        <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.dim }}>
+          <label><input type="checkbox" checked={cal.imu.invLong} onChange={(e) => setCalPath("imu", "invLong", e.target.checked)} /> invertir long.</label>
+          <label><input type="checkbox" checked={cal.imu.invLat} onChange={(e) => setCalPath("imu", "invLat", e.target.checked)} /> invertir lat.</label>
+        </div>
+      </>)}
+    </div>
+  );
+
+  return (
+    <Shell page={page} setPage={setPage} onFile={onFile} fileName={fileName} hasData>
+      {page === "overview" && overview}
+      {page === "analysis" && analysis}
+      {page === "config" && config}
+    </Shell>
+  );
+}
+
+const sel = { background: C.bg, color: C.text, border: `1px solid ${C.line}`, borderRadius: 5, padding: "3px 6px", fontFamily: "monospace" };
+
+/* marco / navegacion */
+function Shell({ children, page, setPage, onFile, fileName, hasData }) {
+  const tab = (id, label) => (
+    <button onClick={() => setPage(id)} disabled={!hasData}
+      style={{ background: "transparent", border: "none", cursor: hasData ? "pointer" : "default",
+        color: page === id ? C.text : C.dim, fontWeight: page === id ? 700 : 500, fontSize: 14,
+        padding: "6px 2px", borderBottom: page === id ? `2px solid ${C.A}` : "2px solid transparent" }}>{label}</button>
+  );
+  return (
+    <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "system-ui, sans-serif" }}>
+      <header style={{ display: "flex", alignItems: "center", gap: 22, padding: "12px 18px", borderBottom: `1px solid ${C.line}`, position: "sticky", top: 0, background: C.bg, zIndex: 5 }}>
+        <div style={{ fontFamily: "monospace", fontWeight: 800, letterSpacing: 1, color: C.A }}>◢ PADDOCK</div>
+        {hasData && <nav style={{ display: "flex", gap: 18 }}>{tab("overview", "Vueltas")}{tab("analysis", "Análisis")}{tab("config", "Calibración")}</nav>}
+        <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
+          {fileName && <span style={{ fontFamily: "monospace", fontSize: 12, color: C.dim }}>{fileName}</span>}
+          {hasData && <label style={{ ...btn(null), padding: "6px 12px", cursor: "pointer" }}>Otro log
+            <input type="file" accept=".csv" onChange={onFile} style={{ display: "none" }} /></label>}
+        </div>
+      </header>
+      <main style={{ padding: 16, maxWidth: 1360, margin: "0 auto" }}>{children}</main>
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+
+<!-- Service worker (solo si se sirve por http/https; da modo offline) -->
+<script>
+if ("serviceWorker" in navigator && location.protocol.startsWith("http")) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("sw.js").catch(()=>{}));
+}
+</script>
+</body>
+</html>
