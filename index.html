@@ -107,7 +107,17 @@ function buildDataset(rows) {
     for (let i = c.idx; i >= 0; i--) { if (data[i].t <= targetT) { s = i; break; } }
     laps.push({ num: c.lap, time: c.time, start: s, end: c.idx });
   });
-  return { data, laps, hasADC };
+
+  // sin vueltas marcadas -> tratar todo el log como una "sesion" para poder analizarlo igual
+  let session = false;
+  if (laps.length === 0 && data.length > 1) {
+    const withFix = data.filter((d) => d.fix === 1 && d.lat !== 0);
+    if (withFix.length > 1) {
+      laps.push({ num: 0, time: (data[data.length - 1].t - data[0].t) / 1000, start: 0, end: data.length - 1, session: true });
+      session = true;
+    }
+  }
+  return { data, laps, hasADC, session };
 }
 
 /* ============================================================
@@ -169,6 +179,68 @@ function computeDelta(gA, gB) {
   return gA.distN.map((dn, i) => gA.trel[i] - interp(gB.distN, gB.trel, dn));
 }
 
+/* estadisticas clave de una vuelta */
+function lapStats(g, cal, hasADC) {
+  const spd = g.seg.map((d) => d.speed);
+  const vmin = Math.min(...spd), vmax = Math.max(...spd);
+  const vavg = spd.reduce((a, b) => a + b, 0) / spd.length;
+  let fullGas = null, braking = null, coasting = null;
+  if (hasADC) {
+    let fg = 0, br = 0, co = 0;
+    g.seg.forEach((d) => {
+      const ga = toGas(d.gas, cal), bk = toBrake(d.brake, cal);
+      if (ga > 90) fg++;
+      if (bk > 8) br++;
+      if (ga < 8 && bk < 8) co++;   // ni gas ni freno = coasting (tiempo "muerto")
+    });
+    const n = g.seg.length;
+    fullGas = fg / n * 100; braking = br / n * 100; coasting = co / n * 100;
+  }
+  const gmax = Math.max(...g.seg.map((d) => Math.abs(accelLL(d, cal).lat)));
+  return { vmin, vmax, vavg, fullGas, braking, coasting, gmax };
+}
+
+/* convierte cortes {lat,lon} a distancias normalizadas en una vuelta, ordenadas */
+function splitDistances(g, splits) {
+  return splits.map((sp) => {
+    let best = 0, bd = Infinity;
+    g.seg.forEach((d, i) => { const dd = (d.lat - sp.lat) ** 2 + (d.lon - sp.lon) ** 2; if (dd < bd) { bd = dd; best = i; } });
+    return g.distN[best];
+  }).sort((a, b) => a - b);
+}
+/* limites de sector [0, ...cortes, 1]. Si no hay cortes -> 3 tramos iguales */
+function sectorBounds(g, splits) {
+  if (splits && splits.length) return [0, ...splitDistances(g, splits), 1];
+  return [0, 1 / 3, 2 / 3, 1];
+}
+/* tiempos por sector segun limites de distancia normalizada */
+function sectorTimes(g, bounds) {
+  const out = [];
+  for (let i = 0; i < bounds.length - 1; i++) {
+    const t0 = interp(g.distN, g.trel, bounds[i]), t1 = interp(g.distN, g.trel, bounds[i + 1]);
+    out.push(t1 - t0);
+  }
+  return out;
+}
+/* vuelta ideal: mejor tiempo de cada sector entre todas las vueltas */
+function theoreticalBest(data, laps, splits) {
+  const geoms = laps.map((l) => lapGeom(data, l)).filter(Boolean);
+  if (!geoms.length) return null;
+  const bounds = sectorBounds(geoms[0], splits);
+  const mat = geoms.map((g) => sectorTimes(g, bounds));
+  const best = [];
+  for (let s = 0; s < bounds.length - 1; s++) {
+    let bv = Infinity;
+    mat.forEach((row) => { if (row[s] < bv) bv = row[s]; });
+    best.push(bv);
+  }
+  return { total: best.reduce((a, b) => a + b, 0), sectors: best };
+}
+
+/* escalas de color */
+const speedColor = (t) => `hsl(${(1 - clamp(t, 0, 1)) * 240}, 85%, 55%)`;  // azul lento -> rojo rapido
+const gColor = (t) => `hsl(${(1 - clamp(t, 0, 1)) * 120}, 85%, 52%)`;      // verde poco G -> rojo mucho G
+
 /* proyeccion equirectangular a viewbox [W,H] con padding */
 function projector(pts, W, H, pad = 16) {
   const lats = pts.map((p) => p.lat), lons = pts.map((p) => p.lon);
@@ -188,7 +260,7 @@ function projector(pts, W, H, pad = 16) {
 /* ============================================================
    MAPA GPS (traza; interactivo opcional; color por delta)
    ============================================================ */
-function GPSMap({ gA, gB, delta, cursor, onPick, W = 560, H = 380, interactive = true, heightCss = null }) {
+function GPSMap({ gA, gB, colors, cursor, onPick, W = 560, H = 380, interactive = true, heightCss = null, splits = null }) {
   const svgRef = useRef(null);
   if (!gA) return <Empty msg="Sin datos GPS con fix en esta vuelta." />;
 
@@ -196,17 +268,15 @@ function GPSMap({ gA, gB, delta, cursor, onPick, W = 560, H = 380, interactive =
   const ptsA = useMemo(() => gA.seg.map(proj), [gA, proj]);
   const ptsB = useMemo(() => (gB ? gB.seg.map(projector(gB.seg, W, H)) : null), [gB, W, H]);
 
-  // color de cada segmento de A por la PENDIENTE del delta (ganas/pierdes)
-  const segColors = useMemo(() => {
-    if (!delta) return null;
-    return delta.map((_, i) => {
-      if (i === 0) return C.dim;
-      const slope = delta[i] - delta[i - 1]; // sube => A pierde tiempo aqui
-      if (slope > 0.0005) return C.loss;
-      if (slope < -0.0005) return C.gain;
-      return C.dim;
+  // posiciones de los cortes de sector sobre la traza A
+  const splitPts = useMemo(() => {
+    if (!splits || !splits.length) return [];
+    return splits.map((sp) => {
+      let best = 0, bd = Infinity;
+      gA.seg.forEach((d, i) => { const dd = (d.lat - sp.lat) ** 2 + (d.lon - sp.lon) ** 2; if (dd < bd) { bd = dd; best = i; } });
+      return ptsA[best];
     });
-  }, [delta]);
+  }, [splits, gA, ptsA]);
 
   const handleClick = useCallback((e) => {
     if (!interactive || !onPick) return;
@@ -225,11 +295,17 @@ function GPSMap({ gA, gB, delta, cursor, onPick, W = 560, H = 380, interactive =
       style={{ cursor: interactive ? "crosshair" : "default", background: C.bg, borderRadius: 8, touchAction: "manipulation", height: heightCss || "auto", display: "block" }}>
       {ptsB && <polyline fill="none" stroke={C.B} strokeOpacity="0.35" strokeWidth="2"
         points={ptsB.map((p) => `${p.x},${p.y}`).join(" ")} />}
-      {segColors
+      {colors
         ? ptsA.slice(1).map((p, i) => (
             <line key={i} x1={ptsA[i].x} y1={ptsA[i].y} x2={p.x} y2={p.y}
-              stroke={segColors[i + 1]} strokeWidth="3.5" strokeLinecap="round" />))
+              stroke={colors[i + 1] || C.dim} strokeWidth="3.5" strokeLinecap="round" />))
         : <polyline fill="none" stroke={C.A} strokeWidth="3" points={ptsA.map((p) => `${p.x},${p.y}`).join(" ")} />}
+      {splitPts.map((p, i) => p && (
+        <g key={i}>
+          <circle cx={p.x} cy={p.y} r="7" fill="none" stroke={C.best} strokeWidth="2.5" />
+          <text x={p.x} y={p.y - 11} fill={C.best} fontSize="12" fontFamily="monospace" textAnchor="middle">S{i + 2}</text>
+        </g>
+      ))}
       {cur && <circle cx={cur.x} cy={cur.y} r="6" fill={C.text} stroke={C.bg} strokeWidth="2" />}
       {ptsA[0] && <circle cx={ptsA[0].x} cy={ptsA[0].y} r="4" fill={C.best} />}
     </svg>
@@ -331,6 +407,15 @@ const Empty = ({ msg }) => <div style={{ color: C.dim, fontSize: 13, padding: 30
 
 function LapRow({ lap, best, isA, isB, onA, onB }) {
   const isBest = lap.time === best;
+  if (lap.session) {
+    return (
+      <div style={{ display: "grid", gridTemplateColumns: "1fr auto", alignItems: "center", gap: 6,
+        padding: "8px", borderBottom: `1px solid ${C.line}`, fontFamily: "monospace", fontSize: 14 }}>
+        <span style={{ color: C.A }}>◉ SESIÓN <span style={{ color: C.dim, fontSize: 11 }}>· log sin meta</span></span>
+        <span style={{ color: C.text }}>{fmtLap(lap.time)}</span>
+      </div>
+    );
+  }
   return (
     <div style={{ display: "grid", gridTemplateColumns: "38px 1fr 62px 62px", alignItems: "center", gap: 6,
       padding: "6px 8px", borderBottom: `1px solid ${C.line}`, fontFamily: "monospace", fontSize: 13 }}>
@@ -357,6 +442,76 @@ function CalField({ label, value, onChange }) {
   );
 }
 
+/* ---- tabla comparativa A vs B ---- */
+function StatsTable({ statsA, statsB, hasADC, gB }) {
+  if (!statsA) return null;
+  // [label, valA, valB, unidad, decimales, mejorEsMas(true)/menos(false)/neutro(null)]
+  const rows = [
+    ["V. mín", statsA.vmin, statsB?.vmin, "km/h", 1, true],
+    ["V. máx", statsA.vmax, statsB?.vmax, "km/h", 1, true],
+    ["V. media", statsA.vavg, statsB?.vavg, "km/h", 1, true],
+    ["G lat máx", statsA.gmax, statsB?.gmax, "g", 2, true],
+  ];
+  if (hasADC) {
+    rows.push(["% full gas", statsA.fullGas, statsB?.fullGas, "%", 0, true]);
+    rows.push(["% freno", statsA.braking, statsB?.braking, "%", 0, null]);
+    rows.push(["% sin gas/freno", statsA.coasting, statsB?.coasting, "%", 0, false]);
+  }
+  const cell = (v, dec) => (v == null ? "—" : v.toFixed(dec));
+  const better = (a, b, more) => (b == null || more == null ? null : more ? (a >= b ? C.A : C.B) : (a <= b ? C.A : C.B));
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+      <div style={{ fontFamily: "monospace", fontSize: 12, color: C.dim, letterSpacing: 1, marginBottom: 8 }}>COMPARATIVA</div>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 14 }}>
+        <thead><tr style={{ color: C.dim, fontSize: 11 }}>
+          <th style={{ textAlign: "left", fontWeight: 400 }}></th>
+          <th style={{ textAlign: "right", color: C.A }}>A</th>
+          {gB && <th style={{ textAlign: "right", color: C.B }}>B</th>}
+        </tr></thead>
+        <tbody>
+          {rows.map(([lab, a, b, u, dec, more], i) => (
+            <tr key={i} style={{ borderTop: `1px solid ${C.line}` }}>
+              <td style={{ color: C.dim, padding: "5px 0" }}>{lab}</td>
+              <td style={{ textAlign: "right", color: better(a, b, more) || C.text }}>{cell(a, dec)}<span style={{ color: C.dim, fontSize: 11 }}> {u}</span></td>
+              {gB && <td style={{ textAlign: "right", color: better(b, a, more) || C.text }}>{cell(b, dec)}<span style={{ color: C.dim, fontSize: 11 }}> {u}</span></td>}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ---- tabla de sectores ---- */
+function SectorTable({ secA, secB }) {
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+      <div style={{ fontFamily: "monospace", fontSize: 12, color: C.dim, letterSpacing: 1, marginBottom: 8 }}>SECTORES</div>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace", fontSize: 14 }}>
+        <thead><tr style={{ color: C.dim, fontSize: 11 }}>
+          <th style={{ textAlign: "left", fontWeight: 400 }}></th>
+          <th style={{ textAlign: "right", color: C.A }}>A</th>
+          <th style={{ textAlign: "right", color: C.B }}>B</th>
+          <th style={{ textAlign: "right" }}>Δ</th>
+        </tr></thead>
+        <tbody>
+          {secA.map((a, i) => {
+            const b = secB[i], d = a - b;
+            return (
+              <tr key={i} style={{ borderTop: `1px solid ${C.line}` }}>
+                <td style={{ color: C.dim, padding: "5px 0" }}>S{i + 1}</td>
+                <td style={{ textAlign: "right", color: a <= b ? C.A : C.text }}>{a.toFixed(2)}</td>
+                <td style={{ textAlign: "right", color: b < a ? C.B : C.text }}>{b.toFixed(2)}</td>
+                <td style={{ textAlign: "right", fontWeight: 700, color: d <= 0 ? C.gain : C.loss }}>{fmtDelta(d)}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
 /* ============================================================
    APP
    ============================================================ */
@@ -369,6 +524,9 @@ function App() {
   const [cursor, setCursor] = useState(null);   // 0..1 sobre vuelta A
   const [xMode, setXMode] = useState("dist");   // eje X: 'dist' (m) | 'time' (s)
   const [xZoom, setXZoom] = useState(null);     // [min,max] del eje X o null
+  const [mapMode, setMapMode] = useState("delta"); // color del mapa: delta | speed | glat
+  const [splits, setSplits] = useState(() => { try { const s = localStorage.getItem("paddock_splits"); return s ? JSON.parse(s) : []; } catch (e) { return []; } });
+  const [sectorEdit, setSectorEdit] = useState(false);
   const [fileName, setFileName] = useState("");
   useEffect(() => { try { localStorage.setItem("paddock_cal", JSON.stringify(cal)); } catch(e){} }, [cal]);
 
@@ -396,6 +554,39 @@ function App() {
   const gB = useMemo(() => (ds && laps[bIdx] && bIdx !== aIdx ? lapGeom(ds.data, laps[bIdx]) : null), [ds, bIdx, aIdx]);
   const delta = useMemo(() => computeDelta(gA, gB), [gA, gB]);
   const finalDelta = delta ? delta[delta.length - 1] : null;
+
+  // colores del mapa segun el modo elegido
+  const mapColors = useMemo(() => {
+    if (!gA) return null;
+    if (mapMode === "delta") {
+      if (!delta) return null;
+      return delta.map((_, i) => {
+        if (i === 0) return C.dim;
+        const s = delta[i] - delta[i - 1];
+        return s > 0.0005 ? C.loss : s < -0.0005 ? C.gain : C.dim;
+      });
+    }
+    if (mapMode === "speed") {
+      const spd = gA.seg.map((d) => d.speed);
+      const lo = Math.min(...spd), hi = Math.max(...spd);
+      return spd.map((v) => speedColor((v - lo) / (hi - lo || 1)));
+    }
+    if (mapMode === "glat") {
+      const gl = gA.seg.map((d) => Math.abs(accelLL(d, cal).lat));
+      const hi = Math.max(...gl, 0.1);
+      return gl.map((v) => gColor(v / hi));
+    }
+    return null;
+  }, [gA, delta, mapMode, cal]);
+
+  useEffect(() => { try { localStorage.setItem("paddock_splits", JSON.stringify(splits)); } catch (e) {} }, [splits]);
+
+  // stats A/B, sectores y vuelta ideal
+  const statsA = useMemo(() => (gA ? lapStats(gA, cal, ds?.hasADC) : null), [gA, cal, ds]);
+  const statsB = useMemo(() => (gB ? lapStats(gB, cal, ds?.hasADC) : null), [gB, cal, ds]);
+  const secA = useMemo(() => (gA ? sectorTimes(gA, sectorBounds(gA, splits)) : null), [gA, splits]);
+  const secB = useMemo(() => (gB ? sectorTimes(gB, sectorBounds(gB, splits)) : null), [gB, splits]);
+  const ideal = useMemo(() => (ds && laps.length ? theoreticalBest(ds.data, laps, splits) : null), [ds, laps, splits]);
 
   // series para graficas. Muestreo por distancia normalizada (alinea A y B espacialmente);
   // el eje X muestra distancia real (m) o tiempo de A (s) segun xMode.
@@ -459,25 +650,57 @@ function App() {
           <LapRow key={i} lap={l} best={best} isA={i === aIdx} isB={i === bIdx}
             onA={() => setAIdx(i)} onB={() => setBIdx(i)} />
         ))}
-      </div>
-      <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", marginBottom: 8 }}>
-          <div style={{ fontFamily: "monospace", fontSize: 12, color: C.dim, letterSpacing: 1 }}>
-            <span style={{ color: C.A }}>A · L{laps[aIdx]?.num} {fmtLap(laps[aIdx]?.time)}</span>
-            {gB && <span style={{ color: C.B, marginLeft: 14 }}>B · L{laps[bIdx]?.num} {fmtLap(laps[bIdx]?.time)}</span>}
+        {ideal && laps.length > 1 && (
+          <div style={{ display: "flex", justifyContent: "space-between", padding: "8px 10px", background: "#10161F", fontFamily: "monospace", fontSize: 13 }}>
+            <span style={{ color: C.best }}>◆ IDEAL</span>
+            <span style={{ color: C.best, fontWeight: 700 }}>{fmtLap(ideal.total)}</span>
           </div>
-          {finalDelta != null && (
-            <div style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 800, color: finalDelta <= 0 ? C.gain : C.loss }}>
-              {fmtDelta(finalDelta)}s
+        )}
+      </div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+        <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8, flexWrap: "wrap", gap: 8 }}>
+            <div style={{ fontFamily: "monospace", fontSize: 12, color: C.dim, letterSpacing: 1 }}>
+              <span style={{ color: C.A }}>A · L{laps[aIdx]?.num} {fmtLap(laps[aIdx]?.time)}</span>
+              {gB && <span style={{ color: C.B, marginLeft: 14 }}>B · L{laps[bIdx]?.num} {fmtLap(laps[bIdx]?.time)}</span>}
             </div>
-          )}
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              <span style={{ fontSize: 11, fontFamily: "monospace", color: C.dim }}>color:</span>
+              <button onClick={() => setMapMode("delta")} style={btn(mapMode === "delta" ? C.A : null)}>Delta</button>
+              <button onClick={() => setMapMode("speed")} style={btn(mapMode === "speed" ? C.A : null)}>Velocidad</button>
+              <button onClick={() => setMapMode("glat")} style={btn(mapMode === "glat" ? C.A : null)}>G lat</button>
+            </div>
+            {finalDelta != null && (
+              <div style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 800, color: finalDelta <= 0 ? C.gain : C.loss }}>
+                {fmtDelta(finalDelta)}s
+              </div>
+            )}
+          </div>
+          <GPSMap gA={gA} gB={gB} colors={mapColors} cursor={cursor} splits={splits}
+            onPick={(f) => {
+              if (sectorEdit && gA) {
+                const i = clamp(Math.round(f * (gA.seg.length - 1)), 0, gA.seg.length - 1);
+                setSplits((s) => [...s, { lat: gA.seg[i].lat, lon: gA.seg[i].lon }]);
+              } else setCursor(f);
+            }}
+            W={900} H={620} heightCss="min(64vh, 620px)" />
+          <div style={{ display: "flex", gap: 10, marginTop: 8, fontSize: 11, fontFamily: "monospace", color: C.dim, alignItems: "center", flexWrap: "wrap" }}>
+            {mapMode === "delta" && <><span><span style={{ color: C.gain }}>▬</span> A gana</span><span><span style={{ color: C.loss }}>▬</span> A pierde</span></>}
+            {mapMode === "speed" && <span>azul = lento · rojo = rápido</span>}
+            {mapMode === "glat" && <span>verde = poco G · rojo = mucho G lateral</span>}
+            {gB && <span><span style={{ color: C.B }}>▬</span> vuelta B</span>}
+            <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+              <button onClick={() => setSectorEdit((v) => !v)} style={btn(sectorEdit ? C.best : null)}>
+                {sectorEdit ? "✓ tocando = corte de sector" : "＋ Definir sectores"}
+              </button>
+              {splits.length > 0 && <button onClick={() => setSplits([])} style={btn(C.loss)}>Limpiar ({splits.length})</button>}
+            </span>
+          </div>
         </div>
-        <GPSMap gA={gA} gB={gB} delta={delta} cursor={cursor} onPick={(f) => { setCursor(f); }} W={900} H={620} heightCss="min(70vh, 640px)" />
-        <div style={{ display: "flex", gap: 16, marginTop: 8, fontSize: 11, fontFamily: "monospace", color: C.dim }}>
-          <span><span style={{ color: C.gain }}>▬</span> A gana</span>
-          <span><span style={{ color: C.loss }}>▬</span> A pierde</span>
-          <span><span style={{ color: C.B }}>▬</span> vuelta B</span>
-          <span style={{ marginLeft: "auto" }}>toca el mapa para fijar el punto →</span>
+        {/* tabla comparativa + sectores */}
+        <div style={{ display: "grid", gridTemplateColumns: gB ? "1fr 1fr" : "1fr", gap: 12 }}>
+          <StatsTable statsA={statsA} statsB={statsB} hasADC={ds.hasADC} gB={!!gB} />
+          {gB && secA && secB && <SectorTable secA={secA} secB={secB} />}
         </div>
       </div>
     </div>
@@ -512,7 +735,7 @@ function App() {
       <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 12 }}>
         <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 8 }}>
           <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>MAPA (solo lectura)</div>
-          <GPSMap gA={gA} gB={gB} delta={delta} cursor={cursor} interactive={false} W={280} H={200} />
+          <GPSMap gA={gA} gB={gB} colors={mapColors} cursor={cursor} interactive={false} W={280} H={200} />
         </div>
         <GGDiagram gA={gA} data={ds.data} cal={cal} cursor={cursor} />
       </div>
