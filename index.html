@@ -222,7 +222,8 @@ function sectorTimes(g, bounds) {
   }
   return out;
 }
-/* vuelta ideal: mejor tiempo de cada sector entre todas las vueltas */
+/* vuelta ideal: mejor tiempo de cada sector entre todas las vueltas.
+   Nunca puede ser peor que la mejor vuelta real -> se limita a ese valor. */
 function theoreticalBest(data, laps, splits) {
   const geoms = laps.map((l) => lapGeom(data, l)).filter(Boolean);
   if (!geoms.length) return null;
@@ -234,12 +235,24 @@ function theoreticalBest(data, laps, splits) {
     mat.forEach((row) => { if (row[s] < bv) bv = row[s]; });
     best.push(bv);
   }
-  return { total: best.reduce((a, b) => a + b, 0), sectors: best };
+  let total = best.reduce((a, b) => a + b, 0);
+  const bestReal = Math.min(...laps.map((l) => l.time));   // mejor vuelta cronometrada
+  if (!(total < bestReal)) total = bestReal;               // red de seguridad
+  return { total, sectors: best, capped: total === bestReal };
 }
 
 /* escalas de color */
 const speedColor = (t) => `hsl(${(1 - clamp(t, 0, 1)) * 240}, 85%, 55%)`;  // azul lento -> rojo rapido
 const gColor = (t) => `hsl(${(1 - clamp(t, 0, 1)) * 120}, 85%, 52%)`;      // verde poco G -> rojo mucho G
+// delta divergente: verde (ganas) - gris (igual) - rojo (pierdes), intensidad segun magnitud
+function deltaColor(slope, scale) {
+  const t = clamp(slope / (scale || 1e-6), -1, 1);
+  const a = Math.abs(t);
+  const hue = t <= 0 ? 150 : 2;
+  return `hsl(${hue}, ${Math.round(a * 80)}%, ${Math.round(62 - a * 14)}%)`;
+}
+const pctl = (arr, p) => { const s = [...arr].sort((a, b) => a - b); return s.length ? s[clamp(Math.floor(s.length * p), 0, s.length - 1)] : 0; };
+const gradientCss = (fn, n = 12) => `linear-gradient(to right, ${Array.from({ length: n }, (_, i) => fn(i / (n - 1))).join(", ")})`;
 
 /* proyeccion equirectangular a viewbox [W,H] con padding */
 function projector(pts, W, H, pad = 16) {
@@ -374,28 +387,34 @@ function Channel({ title, unit, series, color, colorB, cursor, onCursor, domain,
 /* ============================================================
    DIAGRAMA G-G
    ============================================================ */
-function GGDiagram({ gA, data, cal, cursor }) {
-  const pts = useMemo(() => {
-    if (!gA) return [];
-    return gA.seg.map((d, i) => { const a = accelLL(d, cal); return { x: a.lat, y: a.lon, i }; })
+function GGDiagram({ gA, cal, cursor }) {
+  const { pts, vlo, vhi } = useMemo(() => {
+    if (!gA) return { pts: [], vlo: 0, vhi: 0 };
+    const spd = gA.seg.map((d) => d.speed);
+    const vlo = Math.min(...spd), vhi = Math.max(...spd);
+    const pts = gA.seg.map((d, i) => { const a = accelLL(d, cal); return { x: a.lat, y: a.lon, vn: (d.speed - vlo) / (vhi - vlo || 1), i }; })
       .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    return { pts, vlo, vhi };
   }, [gA, cal]);
   const lim = 2.5;
   const curPt = cursor != null && pts.length ? pts[clamp(Math.round(cursor * (pts.length - 1)), 0, pts.length - 1)] : null;
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 10 }}>
-      <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>DIAGRAMA G-G (g)</div>
+      <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>DIAGRAMA G-G · color = velocidad</div>
       <ResponsiveContainer width="100%" height={260}>
         <ScatterChart margin={{ top: 6, right: 6, bottom: 6, left: -6 }}>
           <CartesianGrid stroke={C.grid} />
           <XAxis type="number" dataKey="x" domain={[-lim, lim]} tick={{ fill: C.dim, fontSize: 10 }} name="lateral" />
           <YAxis type="number" dataKey="y" domain={[-lim, lim]} tick={{ fill: C.dim, fontSize: 10 }} name="long" />
           <ReferenceLine x={0} stroke={C.line} /><ReferenceLine y={0} stroke={C.line} />
-          <Scatter data={pts} fill={C.A} fillOpacity={0.35} isAnimationActive={false} />
+          <Scatter data={pts} isAnimationActive={false}>
+            {pts.map((p, i) => <Cell key={i} fill={speedColor(p.vn)} fillOpacity={0.5} />)}
+          </Scatter>
           {curPt && <Scatter data={[curPt]} fill={C.text} isAnimationActive={false} />}
         </ScatterChart>
       </ResponsiveContainer>
-      <div style={{ fontSize: 10, color: C.dim, textAlign: "center" }}>← lateral →  ·  ↑ acelera / ↓ frena</div>
+      <div style={{ fontSize: 10, color: C.dim, textAlign: "center", marginBottom: 6 }}>← lateral →  ·  ↑ acelera / ↓ frena</div>
+      <MapLegend legend={{ grad: gradientCss(speedColor), left: `${vlo.toFixed(0)} km/h`, right: `${vhi.toFixed(0)} km/h` }} />
     </div>
   );
 }
@@ -512,6 +531,63 @@ function SectorTable({ secA, secB }) {
   );
 }
 
+/* ---- leyenda de color del mapa ---- */
+function MapLegend({ legend }) {
+  if (!legend) return null;
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 8, fontFamily: "monospace", fontSize: 11, color: C.dim }}>
+      <span style={{ minWidth: 54, textAlign: "right", color: C.text }}>{legend.left}</span>
+      <div style={{ flex: 1, maxWidth: 220, height: 10, borderRadius: 5, background: legend.grad, border: `1px solid ${C.line}` }} />
+      <span style={{ minWidth: 54, color: C.text }}>{legend.right}</span>
+    </div>
+  );
+}
+
+/* ---- tabla de tiempos y sectores de TODAS las vueltas ---- */
+function AllSectorsTable({ data, laps, splits, ideal }) {
+  const geoms = laps.map((l) => lapGeom(data, l)).filter(Boolean);
+  if (!geoms.length || laps[0]?.session) return <Empty msg="Este log no tiene vueltas cronometradas." />;
+  const bounds = sectorBounds(geoms[0], splits);
+  const nsec = bounds.length - 1;
+  const rows = geoms.map((g, i) => ({ num: laps[i].num, secs: sectorTimes(g, bounds), total: laps[i].time }));
+  const bestSec = Array.from({ length: nsec }, (_, s) => Math.min(...rows.map((r) => r.secs[s])));
+  const bestTot = Math.min(...rows.map((r) => r.total));
+  const th = { padding: "8px 10px", textAlign: "right", color: C.dim, fontWeight: 400, fontSize: 12, borderBottom: `1px solid ${C.line}` };
+  const td = { padding: "8px 10px", textAlign: "right", fontSize: 15 };
+  const secFmt = (s) => s.toFixed(3);
+  return (
+    <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 10, padding: 4, overflowX: "auto" }}>
+      <table style={{ width: "100%", borderCollapse: "collapse", fontFamily: "monospace" }}>
+        <thead><tr>
+          <th style={{ ...th, textAlign: "left" }}>Vuelta</th>
+          {Array.from({ length: nsec }, (_, s) => <th key={s} style={th}>S{s + 1}</th>)}
+          <th style={{ ...th, color: C.text }}>Total</th>
+        </tr></thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={i} style={{ borderBottom: `1px solid ${C.line}` }}>
+              <td style={{ ...td, textAlign: "left", color: r.total === bestTot ? C.best : C.text }}>{r.total === bestTot ? "★" : ""}L{r.num}</td>
+              {r.secs.map((s, si) => (
+                <td key={si} style={{ ...td, color: Math.abs(s - bestSec[si]) < 1e-6 ? C.best : C.text, fontWeight: Math.abs(s - bestSec[si]) < 1e-6 ? 700 : 400 }}>{secFmt(s)}</td>
+              ))}
+              <td style={{ ...td, fontWeight: 700, color: r.total === bestTot ? C.best : C.text }}>{fmtLap(r.total)}</td>
+            </tr>
+          ))}
+          {/* fila ideal: mejor de cada sector */}
+          <tr style={{ background: "#10161F" }}>
+            <td style={{ ...td, textAlign: "left", color: C.best }}>◆ IDEAL</td>
+            {bestSec.map((s, si) => <td key={si} style={{ ...td, color: C.best }}>{secFmt(s)}</td>)}
+            <td style={{ ...td, fontWeight: 700, color: C.best }}>{ideal ? fmtLap(ideal.total) : "—"}</td>
+          </tr>
+        </tbody>
+      </table>
+      <div style={{ padding: "6px 10px", fontSize: 11, fontFamily: "monospace", color: C.dim }}>
+        <span style={{ color: C.best }}>★ / morado</span> = mejor de cada columna · {nsec} sectores {splits.length ? "(definidos por ti)" : "(3 automáticos)"}
+      </div>
+    </div>
+  );
+}
+
 /* ============================================================
    APP
    ============================================================ */
@@ -555,29 +631,38 @@ function App() {
   const delta = useMemo(() => computeDelta(gA, gB), [gA, gB]);
   const finalDelta = delta ? delta[delta.length - 1] : null;
 
-  // colores del mapa segun el modo elegido
-  const mapColors = useMemo(() => {
-    if (!gA) return null;
+  // colores del mapa + info de leyenda segun el modo
+  const mapData = useMemo(() => {
+    if (!gA) return { colors: null, legend: null };
     if (mapMode === "delta") {
-      if (!delta) return null;
-      return delta.map((_, i) => {
-        if (i === 0) return C.dim;
-        const s = delta[i] - delta[i - 1];
-        return s > 0.0005 ? C.loss : s < -0.0005 ? C.gain : C.dim;
-      });
+      if (!delta) return { colors: null, legend: null };
+      const slopes = delta.map((_, i) => (i === 0 ? 0 : delta[i] - delta[i - 1]));
+      const scale = pctl(slopes.map(Math.abs).filter((x) => x > 0), 0.9) || 1e-6;
+      return {
+        colors: slopes.map((s) => deltaColor(s, scale)),
+        legend: { grad: gradientCss((u) => deltaColor((u * 2 - 1) * scale, scale)), left: "ganas", right: "pierdes", title: "Delta A vs B" },
+      };
     }
     if (mapMode === "speed") {
       const spd = gA.seg.map((d) => d.speed);
       const lo = Math.min(...spd), hi = Math.max(...spd);
-      return spd.map((v) => speedColor((v - lo) / (hi - lo || 1)));
+      return {
+        colors: spd.map((v) => speedColor((v - lo) / (hi - lo || 1))),
+        legend: { grad: gradientCss(speedColor), left: `${lo.toFixed(0)} km/h`, right: `${hi.toFixed(0)} km/h`, title: "Velocidad" },
+      };
     }
     if (mapMode === "glat") {
       const gl = gA.seg.map((d) => Math.abs(accelLL(d, cal).lat));
       const hi = Math.max(...gl, 0.1);
-      return gl.map((v) => gColor(v / hi));
+      return {
+        colors: gl.map((v) => gColor(v / hi)),
+        legend: { grad: gradientCss(gColor), left: "0 g", right: `${hi.toFixed(1)} g`, title: "G lateral" },
+      };
     }
-    return null;
+    return { colors: null, legend: null };
   }, [gA, delta, mapMode, cal]);
+  const mapColors = mapData.colors;
+  const mapLegend = mapData.legend;
 
   useEffect(() => { try { localStorage.setItem("paddock_splits", JSON.stringify(splits)); } catch (e) {} }, [splits]);
 
@@ -684,11 +769,9 @@ function App() {
               } else setCursor(f);
             }}
             W={900} H={620} heightCss="min(64vh, 620px)" />
-          <div style={{ display: "flex", gap: 10, marginTop: 8, fontSize: 11, fontFamily: "monospace", color: C.dim, alignItems: "center", flexWrap: "wrap" }}>
-            {mapMode === "delta" && <><span><span style={{ color: C.gain }}>▬</span> A gana</span><span><span style={{ color: C.loss }}>▬</span> A pierde</span></>}
-            {mapMode === "speed" && <span>azul = lento · rojo = rápido</span>}
-            {mapMode === "glat" && <span>verde = poco G · rojo = mucho G lateral</span>}
-            {gB && <span><span style={{ color: C.B }}>▬</span> vuelta B</span>}
+          <div style={{ display: "flex", gap: 12, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <MapLegend legend={mapLegend} />
+            {gB && <span style={{ fontSize: 11, fontFamily: "monospace", color: C.dim }}><span style={{ color: C.B }}>▬</span> vuelta B</span>}
             <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
               <button onClick={() => setSectorEdit((v) => !v)} style={btn(sectorEdit ? C.best : null)}>
                 {sectorEdit ? "✓ tocando = corte de sector" : "＋ Definir sectores"}
@@ -734,10 +817,11 @@ function App() {
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 12 }}>
         <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 8 }}>
-          <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>MAPA (solo lectura)</div>
+          <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>MAPA · {mapLegend?.title || ""}</div>
           <GPSMap gA={gA} gB={gB} colors={mapColors} cursor={cursor} interactive={false} W={280} H={200} />
+          <div style={{ marginTop: 6 }}><MapLegend legend={mapLegend} /></div>
         </div>
-        <GGDiagram gA={gA} data={ds.data} cal={cal} cursor={cursor} />
+        <GGDiagram gA={gA} cal={cal} cursor={cursor} />
       </div>
     </div>
   );
@@ -794,9 +878,20 @@ function App() {
     </div>
   );
 
+  const times = (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ fontFamily: "monospace", fontSize: 13, color: C.dim, letterSpacing: 1 }}>
+        TIEMPOS Y SECTORES · {laps.length} vuelta{laps.length !== 1 ? "s" : ""}
+        {splits.length === 0 && <span style={{ marginLeft: 10, color: C.dim }}>· define cortes en el mapa (pestaña Vueltas) para sectores propios</span>}
+      </div>
+      <AllSectorsTable data={ds.data} laps={laps} splits={splits} ideal={ideal} />
+    </div>
+  );
+
   return (
     <Shell page={page} setPage={setPage} onFile={onFile} fileName={fileName} hasData>
       {page === "overview" && overview}
+      {page === "times" && times}
       {page === "analysis" && analysis}
       {page === "config" && config}
     </Shell>
@@ -817,7 +912,7 @@ function Shell({ children, page, setPage, onFile, fileName, hasData }) {
     <div style={{ minHeight: "100vh", background: C.bg, color: C.text, fontFamily: "system-ui, sans-serif" }}>
       <header style={{ display: "flex", alignItems: "center", gap: 22, padding: "12px 18px", paddingTop: "calc(12px + env(safe-area-inset-top))", paddingLeft: "calc(18px + env(safe-area-inset-left))", paddingRight: "calc(18px + env(safe-area-inset-right))", borderBottom: `1px solid ${C.line}`, position: "sticky", top: 0, background: C.bg, zIndex: 5 }}>
         <div style={{ fontFamily: "monospace", fontWeight: 800, letterSpacing: 1, color: C.A }}>◢ PADDOCK</div>
-        {hasData && <nav style={{ display: "flex", gap: 18 }}>{tab("overview", "Vueltas")}{tab("analysis", "Análisis")}{tab("config", "Calibración")}</nav>}
+        {hasData && <nav style={{ display: "flex", gap: 18 }}>{tab("overview", "Vueltas")}{tab("times", "Tiempos")}{tab("analysis", "Análisis")}{tab("config", "Calibración")}</nav>}
         <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", gap: 12 }}>
           {fileName && <span style={{ fontFamily: "monospace", fontSize: 12, color: C.dim }}>{fileName}</span>}
           {hasData && <label style={{ ...btn(null), padding: "6px 12px", cursor: "pointer" }}>Otro log
