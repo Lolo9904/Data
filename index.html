@@ -127,7 +127,7 @@ const defaultCal = () => ({
   gas: { min: 0, max: 4095 },
   brake: { min: 0, max: 4095 },
   steer: { left: 0, center: 2048, right: 4095, maxAngle: 90 },
-  imu: { long: "ax", lat: "ay", rot: 0, invLong: false, invLat: false },
+  imu: { long: "ax", lat: "ay", rot: 0, invLong: false, invLat: false, yaw: "gx", yawInv: false },
 });
 
 function autoCal(data) {
@@ -177,6 +177,51 @@ function lapGeom(data, lap) {
 function computeDelta(gA, gB) {
   if (!gA || !gB) return null;
   return gA.distN.map((dn, i) => gA.trel[i] - interp(gB.distN, gB.trel, dn));
+}
+
+/* media movil (suaviza ruido de las derivadas) */
+function movavg(arr, w) {
+  return arr.map((_, i) => { let s = 0, n = 0; for (let k = -w; k <= w; k++) { const j = i + k; if (j >= 0 && j < arr.length) { s += arr[j]; n++; } } return s / n; });
+}
+/* aceleracion longitudinal por GPS (dv/dt) en g -- fiable aunque la IMU vaya suelta */
+function accLongGPS(g) {
+  const raw = g.seg.map((d, i) => {
+    if (i === 0) return 0;
+    const dt = (g.seg[i].t - g.seg[i - 1].t) / 1000;
+    return dt > 0 ? (g.seg[i].speed - g.seg[i - 1].speed) / 3.6 / dt / 9.81 : 0;
+  });
+  return movavg(raw, 6);
+}
+/* yaw segun GPS: ritmo de cambio del rumbo (dps).
+   El rumbo se calcula sobre una VENTANA (no punto a punto) porque a baja
+   velocidad el GPS es demasiado ruidoso; y se limita a un rango fisico. */
+function yawGPS(g) {
+  const seg = g.seg, n = seg.length, W = 4, M = 4;
+  const head = seg.map((d, i) => {
+    const a = seg[Math.max(0, i - W)], b = seg[Math.min(n - 1, i + W)];
+    const dlat = b.lat - a.lat, dlon = (b.lon - a.lon) * Math.cos(a.lat * Math.PI / 180);
+    return Math.hypot(dlat, dlon) > 1e-7 ? Math.atan2(dlon, dlat) * 180 / Math.PI : null;
+  });
+  const raw = seg.map((d, i) => {
+    const i0 = Math.max(0, i - M), i1 = Math.min(n - 1, i + M);
+    if (head[i0] === null || head[i1] === null || seg[i].speed < 10) return 0;
+    let dh = head[i1] - head[i0];
+    while (dh > 180) dh -= 360; while (dh < -180) dh += 360;
+    const dt = (seg[i1].t - seg[i0].t) / 1000;
+    return dt > 0 ? clamp(dh / dt, -300, 300) : 0;   // limite fisico ±300 dps
+  });
+  return movavg(raw, 6);
+}
+/* yaw segun IMU (giroscopo, eje configurable) en dps */
+function yawIMU(g, cal) {
+  const k = cal.imu.yaw || "gx";
+  const sgn = cal.imu.yawInv ? -1 : 1;
+  return movavg(g.seg.map((d) => d[k] * sgn), 4);
+}
+/* derrape = yaw IMU - yaw GPS: el quad rota mas (o menos) que su trayectoria */
+function slipSeries(g, cal) {
+  const yi = yawIMU(g, cal), yg = yawGPS(g);
+  return yi.map((v, i) => v - yg[i]);
 }
 
 /* estadisticas clave de una vuelta */
@@ -644,7 +689,7 @@ function App() {
   const [mapMode, setMapMode] = useState("delta"); // color del mapa: delta | speed | glat
   const [splits, setSplits] = useState(() => { try { const s = localStorage.getItem("paddock_splits"); return s ? JSON.parse(s) : []; } catch (e) { return []; } });
   const [sectorEdit, setSectorEdit] = useState(false);
-  const [chans, setChans] = useState({ speed: true, gas: true, brake: true, steer: true });
+  const [chans, setChans] = useState({ speed: true, gas: true, brake: true, steer: true, accLong: true, yaw: true, slip: true });
   const [smooth, setSmooth] = useState(3);      // suavizado IMU (media movil ±N muestras)
   const [fileName, setFileName] = useState("");
   useEffect(() => { try { localStorage.setItem("paddock_cal", JSON.stringify(cal)); } catch(e){} }, [cal]);
@@ -702,6 +747,14 @@ function App() {
         legend: { grad: gradientCss(gColor), left: "0 g", right: `${hi.toFixed(1)} g`, title: "G lateral" },
       };
     }
+    if (mapMode === "slip") {
+      const sl = slipSeries(gA, cal).map(Math.abs);
+      const hi = Math.max(pctl(sl.filter((x) => x > 0), 0.95), 10);
+      return {
+        colors: sl.map((v) => gColor(v / hi)),
+        legend: { grad: gradientCss(gColor), left: "agarrado", right: `derrape ${hi.toFixed(0)}°/s`, title: "Derrape" },
+      };
+    }
     return { colors: null, legend: null };
   }, [gA, delta, mapMode, cal]);
   const mapColors = mapData.colors;
@@ -735,12 +788,22 @@ function App() {
         return { d: xVal(dn), f: dn, a: fa(dn), b: fb ? fb(dn) : null };
       });
     };
+    // canales derivados (arrays alineados con g.seg -> se interpolan por distancia)
+    const derA = { acc: accLongGPS(gA), yaw: yawIMU(gA, cal), slip: slipSeries(gA, cal) };
+    const derB = gB ? { acc: accLongGPS(gB), yaw: yawIMU(gB, cal), slip: slipSeries(gB, cal) } : null;
+    const mkArr = (arrA, arrB) => Array.from({ length: N }, (_, i) => {
+      const dn = i / (N - 1);
+      return { d: xVal(dn), f: dn, a: interp(gA.distN, arrA, dn), b: arrB && gB ? interp(gB.distN, arrB, dn) : null };
+    });
     return {
       xMax: xVal(1),
       speed: mk((d) => d.speed),
       gas: mk((d) => toGas(d.gas, cal)),
       brake: mk((d) => toBrake(d.brake, cal)),
       steer: mk((d) => toSteer(d.steer, cal)),
+      accLong: mkArr(derA.acc, derB?.acc),
+      yaw: mkArr(derA.yaw, derB?.yaw),
+      slip: mkArr(derA.slip, derB?.slip),
       deltaLine: (() => {
         if (!delta) return null;
         return Array.from({ length: N }, (_, i) => { const dn = i / (N - 1); return { d: xVal(dn), f: dn, a: interp(gA.distN, delta, dn) }; });
@@ -797,6 +860,7 @@ function App() {
               <button onClick={() => setMapMode("delta")} style={btn(mapMode === "delta" ? C.A : null)}>Delta</button>
               <button onClick={() => setMapMode("speed")} style={btn(mapMode === "speed" ? C.A : null)}>Velocidad</button>
               <button onClick={() => setMapMode("glat")} style={btn(mapMode === "glat" ? C.A : null)}>G lat</button>
+              <button onClick={() => setMapMode("slip")} style={btn(mapMode === "slip" ? C.A : null)}>Derrape</button>
             </div>
             {finalDelta != null && (
               <div style={{ fontFamily: "monospace", fontSize: 20, fontWeight: 800, color: finalDelta <= 0 ? C.gain : C.loss }}>
@@ -843,9 +907,12 @@ function App() {
           <button onClick={() => { setXMode("dist"); setXZoom(null); }} style={btn(xMode === "dist" ? C.A : null)}>Distancia (m)</button>
           <button onClick={() => { setXMode("time"); setXZoom(null); }} style={btn(xMode === "time" ? C.A : null)}>Tiempo (s)</button>
           {xZoom && <button onClick={() => setXZoom(null)} style={{ ...btn(C.loss) }}>Reset zoom ✕</button>}
-          <span style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+          <span style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
             <span>ver:</span>
             <ChanToggle label="Vel" on={chans.speed} onClick={() => setChans((c) => ({ ...c, speed: !c.speed }))} />
+            <ChanToggle label="AcelGPS" on={chans.accLong} onClick={() => setChans((c) => ({ ...c, accLong: !c.accLong }))} />
+            <ChanToggle label="Yaw" on={chans.yaw} onClick={() => setChans((c) => ({ ...c, yaw: !c.yaw }))} />
+            <ChanToggle label="Derrape" on={chans.slip} onClick={() => setChans((c) => ({ ...c, slip: !c.slip }))} />
             {ds.hasADC && <>
               <ChanToggle label="Gas" on={chans.gas} onClick={() => setChans((c) => ({ ...c, gas: !c.gas }))} />
               <ChanToggle label="Freno" on={chans.brake} onClick={() => setChans((c) => ({ ...c, brake: !c.brake }))} />
@@ -855,6 +922,9 @@ function App() {
         </div>
         {series && <>
           {chans.speed && <Channel title="Velocidad" unit="km/h" series={series.speed} color={C.A} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, "auto"]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
+          {chans.accLong && <Channel title="Aceleración GPS (frena − / acelera +)" unit="g" series={series.accLong} color={C.gain} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[-1.5, 1.5]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
+          {chans.yaw && <Channel title="Giro / Yaw (IMU)" unit="°/s" series={series.yaw} color={C.best} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={["auto", "auto"]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
+          {chans.slip && <Channel title="Derrape (yaw IMU − giro GPS)" unit="°/s" series={series.slip} color={C.loss} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={["auto", "auto"]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
           {ds.hasADC ? <>
             {chans.gas && <Channel title="Acelerador" unit="%" series={series.gas} color={C.gain} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
             {chans.brake && <Channel title="Freno" unit="%" series={series.brake} color={C.loss} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
@@ -932,6 +1002,15 @@ function App() {
         <div style={{ display: "flex", gap: 12, fontSize: 12, color: C.dim }}>
           <label><input type="checkbox" checked={cal.imu.invLong} onChange={(e) => setCalPath("imu", "invLong", e.target.checked)} /> invertir long.</label>
           <label><input type="checkbox" checked={cal.imu.invLat} onChange={(e) => setCalPath("imu", "invLat", e.target.checked)} /> invertir lat.</label>
+        </div>
+        <div style={{ borderTop: `1px solid ${C.line}`, marginTop: 8, paddingTop: 8 }}>
+          <label style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.dim, marginBottom: 6 }}>
+            eje de giro (yaw, para derrape)
+            <select value={cal.imu.yaw || "gx"} onChange={(e) => setCalPath("imu", "yaw", e.target.value)} style={sel}>
+              <option value="gx">Gx</option><option value="gy">Gy</option><option value="gz">Gz</option>
+            </select>
+          </label>
+          <label style={{ fontSize: 12, color: C.dim }}><input type="checkbox" checked={cal.imu.yawInv || false} onChange={(e) => setCalPath("imu", "yawInv", e.target.checked)} /> invertir giro (si el derrape sale al revés)</label>
         </div>
       </>)}
     </div>
