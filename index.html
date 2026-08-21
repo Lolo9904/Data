@@ -278,18 +278,38 @@ function GPSMap({ gA, gB, colors, cursor, onPick, W = 560, H = 380, interactive 
   if (!gA) return <Empty msg="Sin datos GPS con fix en esta vuelta." />;
 
   const proj = useMemo(() => projector(gA.seg, W, H), [gA, W, H]);
-  const ptsA = useMemo(() => gA.seg.map(proj), [gA, proj]);
-  const ptsB = useMemo(() => (gB ? gB.seg.map(projector(gB.seg, W, H)) : null), [gB, W, H]);
 
-  // posiciones de los cortes de sector sobre la traza A
+  // submuestreo del DIBUJO (no del calculo) para no petar el SVG con vueltas largas
+  const MAXDRAW = 900;
+  const draw = useMemo(() => {
+    const step = Math.max(1, Math.ceil(gA.seg.length / MAXDRAW));
+    const idx = []; for (let i = 0; i < gA.seg.length; i += step) idx.push(i);
+    if (idx[idx.length - 1] !== gA.seg.length - 1) idx.push(gA.seg.length - 1);
+    return {
+      pts: idx.map((i) => proj(gA.seg[i])),
+      cols: colors ? idx.map((i) => colors[i]) : null,
+      idx,
+    };
+  }, [gA, proj, colors]);
+  const ptsA = draw.pts;
+
+  const ptsB = useMemo(() => {
+    if (!gB) return null;
+    const projB = projector(gB.seg, W, H);
+    const step = Math.max(1, Math.ceil(gB.seg.length / MAXDRAW));
+    const out = []; for (let i = 0; i < gB.seg.length; i += step) out.push(projB(gB.seg[i]));
+    return out;
+  }, [gB, W, H]);
+
+  // cortes de sector: proyectados directamente (independientes del submuestreo)
   const splitPts = useMemo(() => {
     if (!splits || !splits.length) return [];
     return splits.map((sp) => {
       let best = 0, bd = Infinity;
       gA.seg.forEach((d, i) => { const dd = (d.lat - sp.lat) ** 2 + (d.lon - sp.lon) ** 2; if (dd < bd) { bd = dd; best = i; } });
-      return ptsA[best];
+      return proj(gA.seg[best]);
     });
-  }, [splits, gA, ptsA]);
+  }, [splits, gA, proj]);
 
   const handleClick = useCallback((e) => {
     if (!interactive || !onPick) return;
@@ -298,20 +318,20 @@ function GPSMap({ gA, gB, colors, cursor, onPick, W = 560, H = 380, interactive 
     const y = ((e.clientY - rect.top) / rect.height) * H;
     let best = 0, bd = Infinity;
     ptsA.forEach((p, i) => { const dd = (p.x - x) ** 2 + (p.y - y) ** 2; if (dd < bd) { bd = dd; best = i; } });
-    onPick(best / (ptsA.length - 1));
-  }, [interactive, onPick, ptsA, W, H]);
+    onPick(draw.idx[best] / (gA.seg.length - 1));
+  }, [interactive, onPick, ptsA, draw, gA, W, H]);
 
-  const cur = cursor != null ? ptsA[clamp(Math.round(cursor * (ptsA.length - 1)), 0, ptsA.length - 1)] : null;
+  const cur = cursor != null ? proj(gA.seg[clamp(Math.round(cursor * (gA.seg.length - 1)), 0, gA.seg.length - 1)]) : null;
 
   return (
     <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} width="100%" onClick={handleClick}
       style={{ cursor: interactive ? "crosshair" : "default", background: C.bg, borderRadius: 8, touchAction: "manipulation", height: heightCss || "auto", display: "block" }}>
       {ptsB && <polyline fill="none" stroke={C.B} strokeOpacity="0.35" strokeWidth="2"
         points={ptsB.map((p) => `${p.x},${p.y}`).join(" ")} />}
-      {colors
+      {draw.cols
         ? ptsA.slice(1).map((p, i) => (
             <line key={i} x1={ptsA[i].x} y1={ptsA[i].y} x2={p.x} y2={p.y}
-              stroke={colors[i + 1] || C.dim} strokeWidth="3.5" strokeLinecap="round" />))
+              stroke={draw.cols[i + 1] || C.dim} strokeWidth="3.5" strokeLinecap="round" />))
         : <polyline fill="none" stroke={C.A} strokeWidth="3" points={ptsA.map((p) => `${p.x},${p.y}`).join(" ")} />}
       {splitPts.map((p, i) => p && (
         <g key={i}>
@@ -387,15 +407,25 @@ function Channel({ title, unit, series, color, colorB, cursor, onCursor, domain,
 /* ============================================================
    DIAGRAMA G-G
    ============================================================ */
-function GGDiagram({ gA, cal, cursor }) {
+function GGDiagram({ gA, cal, cursor, smooth }) {
   const { pts, vlo, vhi } = useMemo(() => {
     if (!gA) return { pts: [], vlo: 0, vhi: 0 };
     const spd = gA.seg.map((d) => d.speed);
     const vlo = Math.min(...spd), vhi = Math.max(...spd);
-    const pts = gA.seg.map((d, i) => { const a = accelLL(d, cal); return { x: a.lat, y: a.lon, vn: (d.speed - vlo) / (vhi - vlo || 1), i }; })
-      .filter((p) => Number.isFinite(p.x) && Number.isFinite(p.y));
+    // suavizado (media movil) para quitar la vibracion del quad
+    const win = Math.max(1, smooth | 0);
+    const lat = gA.seg.map((d) => accelLL(d, cal).lat);
+    const lon = gA.seg.map((d) => accelLL(d, cal).lon);
+    const smoo = (arr, i) => { let s = 0, n = 0; for (let k = -win; k <= win; k++) { const j = i + k; if (j >= 0 && j < arr.length) { s += arr[j]; n++; } } return s / n; };
+    // submuestreo del dibujo
+    const MAX = 1500, step = Math.max(1, Math.ceil(gA.seg.length / MAX));
+    const pts = [];
+    for (let i = 0; i < gA.seg.length; i += step) {
+      const x = smoo(lat, i), y = smoo(lon, i);
+      if (Number.isFinite(x) && Number.isFinite(y)) pts.push({ x, y, vn: (gA.seg[i].speed - vlo) / (vhi - vlo || 1), i });
+    }
     return { pts, vlo, vhi };
-  }, [gA, cal]);
+  }, [gA, cal, smooth]);
   const lim = 2.5;
   const curPt = cursor != null && pts.length ? pts[clamp(Math.round(cursor * (pts.length - 1)), 0, pts.length - 1)] : null;
   return (
@@ -531,6 +561,17 @@ function SectorTable({ secA, secB }) {
   );
 }
 
+/* ---- toggle de canal (mostrar/ocultar) ---- */
+function ChanToggle({ label, on, onClick }) {
+  return (
+    <button onClick={onClick} style={{
+      background: on ? C.line : "transparent", color: on ? C.text : C.dim,
+      border: `1px solid ${C.line}`, borderRadius: 5, padding: "3px 8px", cursor: "pointer",
+      fontFamily: "monospace", fontSize: 11, textDecoration: on ? "none" : "line-through",
+    }}>{label}</button>
+  );
+}
+
 /* ---- leyenda de color del mapa ---- */
 function MapLegend({ legend }) {
   if (!legend) return null;
@@ -603,6 +644,8 @@ function App() {
   const [mapMode, setMapMode] = useState("delta"); // color del mapa: delta | speed | glat
   const [splits, setSplits] = useState(() => { try { const s = localStorage.getItem("paddock_splits"); return s ? JSON.parse(s) : []; } catch (e) { return []; } });
   const [sectorEdit, setSectorEdit] = useState(false);
+  const [chans, setChans] = useState({ speed: true, gas: true, brake: true, steer: true });
+  const [smooth, setSmooth] = useState(3);      // suavizado IMU (media movil ±N muestras)
   const [fileName, setFileName] = useState("");
   useEffect(() => { try { localStorage.setItem("paddock_cal", JSON.stringify(cal)); } catch(e){} }, [cal]);
 
@@ -770,14 +813,16 @@ function App() {
             }}
             W={900} H={620} heightCss="min(64vh, 620px)" />
           <div style={{ display: "flex", gap: 12, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ fontSize: 11, fontFamily: "monospace", color: C.dim, letterSpacing: 1, minWidth: 70 }}>{mapLegend?.title?.toUpperCase() || "MAPA"}</span>
             <MapLegend legend={mapLegend} />
             {gB && <span style={{ fontSize: 11, fontFamily: "monospace", color: C.dim }}><span style={{ color: C.B }}>▬</span> vuelta B</span>}
-            <span style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
-              <button onClick={() => setSectorEdit((v) => !v)} style={btn(sectorEdit ? C.best : null)}>
-                {sectorEdit ? "✓ tocando = corte de sector" : "＋ Definir sectores"}
-              </button>
-              {splits.length > 0 && <button onClick={() => setSplits([])} style={btn(C.loss)}>Limpiar ({splits.length})</button>}
-            </span>
+          </div>
+          <div style={{ display: "flex", gap: 6, marginTop: 8, alignItems: "center" }}>
+            <button onClick={() => setSectorEdit((v) => !v)} style={btn(sectorEdit ? C.best : null)}>
+              {sectorEdit ? "✓ tocando = corte de sector" : "＋ Definir sectores"}
+            </button>
+            {splits.length > 0 && <button onClick={() => setSplits([])} style={btn(C.loss)}>Limpiar ({splits.length})</button>}
+            {sectorEdit && <span style={{ fontSize: 11, fontFamily: "monospace", color: C.dim }}>toca el mapa donde quieras un corte</span>}
           </div>
         </div>
         {/* tabla comparativa + sectores */}
@@ -793,23 +838,30 @@ function App() {
   const analysis = (
     <div style={{ display: "grid", gridTemplateColumns: "1fr 300px", gap: 14, alignItems: "start" }}>
       <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, fontFamily: "monospace", color: C.dim }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, fontFamily: "monospace", color: C.dim, flexWrap: "wrap" }}>
           <span>eje X:</span>
           <button onClick={() => { setXMode("dist"); setXZoom(null); }} style={btn(xMode === "dist" ? C.A : null)}>Distancia (m)</button>
           <button onClick={() => { setXMode("time"); setXZoom(null); }} style={btn(xMode === "time" ? C.A : null)}>Tiempo (s)</button>
-          {xZoom
-            ? <button onClick={() => setXZoom(null)} style={{ ...btn(C.loss), marginLeft: 8 }}>Reset zoom ✕</button>
-            : <span style={{ marginLeft: "auto", color: C.dim }}>arrastra sobre una gráfica para hacer zoom →</span>}
+          {xZoom && <button onClick={() => setXZoom(null)} style={{ ...btn(C.loss) }}>Reset zoom ✕</button>}
+          <span style={{ marginLeft: "auto", display: "flex", gap: 8, alignItems: "center" }}>
+            <span>ver:</span>
+            <ChanToggle label="Vel" on={chans.speed} onClick={() => setChans((c) => ({ ...c, speed: !c.speed }))} />
+            {ds.hasADC && <>
+              <ChanToggle label="Gas" on={chans.gas} onClick={() => setChans((c) => ({ ...c, gas: !c.gas }))} />
+              <ChanToggle label="Freno" on={chans.brake} onClick={() => setChans((c) => ({ ...c, brake: !c.brake }))} />
+              <ChanToggle label="Dir" on={chans.steer} onClick={() => setChans((c) => ({ ...c, steer: !c.steer }))} />
+            </>}
+          </span>
         </div>
         {series && <>
-          <Channel title="Velocidad" unit="km/h" series={series.speed} color={C.A} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, "auto"]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
+          {chans.speed && <Channel title="Velocidad" unit="km/h" series={series.speed} color={C.A} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, "auto"]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
           {ds.hasADC ? <>
-            <Channel title="Acelerador" unit="%" series={series.gas} color={C.gain} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
-            <Channel title="Freno" unit="%" series={series.brake} color={C.loss} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
-            <Channel title="Dirección" unit="°" series={series.steer} color={C.best} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[-cal.steer.maxAngle, cal.steer.maxAngle]}  xDomain={xZoom || undefined} onZoom={setXZoom} />
+            {chans.gas && <Channel title="Acelerador" unit="%" series={series.gas} color={C.gain} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
+            {chans.brake && <Channel title="Freno" unit="%" series={series.brake} color={C.loss} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[0, 100]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
+            {chans.steer && <Channel title="Dirección" unit="°" series={series.steer} color={C.best} colorB={gB ? C.B : null} cursor={cursor} onCursor={setCursor} domain={[-cal.steer.maxAngle, cal.steer.maxAngle]}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
           </> : (
             <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: "12px 14px", fontSize: 12, color: C.dim }}>
-              Este log no incluye canales de pedales/dirección (formato antiguo). Velocidad, delta y G-G sí están disponibles.
+              Este log solo tiene acelerador (sin freno/dirección). Puedes ocultar canales arriba para dar más espacio.
             </div>
           )}
           {series.deltaLine && <Channel title="Delta A−B (acumulado)" unit="s" series={series.deltaLine} color={C.text} cursor={cursor} onCursor={setCursor} domain={["auto", "auto"]} height={100} showX xUnit={xMode === "time" ? "s" : "m"}  xDomain={xZoom || undefined} onZoom={setXZoom} />}
@@ -821,7 +873,14 @@ function App() {
           <GPSMap gA={gA} gB={gB} colors={mapColors} cursor={cursor} interactive={false} W={280} H={200} />
           <div style={{ marginTop: 6 }}><MapLegend legend={mapLegend} /></div>
         </div>
-        <GGDiagram gA={gA} cal={cal} cursor={cursor} />
+        <GGDiagram gA={gA} cal={cal} cursor={cursor} smooth={smooth} />
+        <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 10 }}>
+          <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>
+            SUAVIZADO IMU: ±{smooth} muestras {smooth === 0 ? "(crudo)" : ""}
+          </div>
+          <input type="range" min={0} max={15} value={smooth} onChange={(e) => setSmooth(+e.target.value)} style={{ width: "100%" }} />
+          <div style={{ fontSize: 10, color: C.dim }}>sube si el G-G está muy disperso por la vibración del quad</div>
+        </div>
       </div>
     </div>
   );
