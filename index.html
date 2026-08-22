@@ -318,11 +318,24 @@ function projector(pts, W, H, pad = 16) {
 /* ============================================================
    MAPA GPS (traza; interactivo opcional; color por delta)
    ============================================================ */
-function GPSMap({ gA, gB, colors, cursor, onPick, W = 560, H = 380, interactive = true, heightCss = null, splits = null }) {
+function GPSMap({ gA, gB, colors, cursor, onPick, W = 560, H = 380, interactive = true, heightCss = null, splits = null, zoomFrac = null }) {
   const svgRef = useRef(null);
   if (!gA) return <Empty msg="Sin datos GPS con fix en esta vuelta." />;
 
   const proj = useMemo(() => projector(gA.seg, W, H), [gA, W, H]);
+
+  // viewBox: completo, o ampliado al tramo de zoom
+  const vb = useMemo(() => {
+    if (!zoomFrac) return { box: `0 0 ${W} ${H}`, k: 1 };
+    const [a, b] = zoomFrac; const pts = [];
+    for (let i = 0; i < gA.seg.length; i++) if (gA.distN[i] >= a && gA.distN[i] <= b) pts.push(proj(gA.seg[i]));
+    if (pts.length < 2) return { box: `0 0 ${W} ${H}`, k: 1 };
+    let minx = Infinity, miny = Infinity, maxx = -Infinity, maxy = -Infinity;
+    pts.forEach((p) => { minx = Math.min(minx, p.x); miny = Math.min(miny, p.y); maxx = Math.max(maxx, p.x); maxy = Math.max(maxy, p.y); });
+    const w = maxx - minx, h = maxy - miny, pad = Math.max(w, h) * 0.18 + 8;
+    const bw = w + 2 * pad, bh = h + 2 * pad;
+    return { box: `${minx - pad} ${miny - pad} ${bw} ${bh}`, k: Math.max(bw / W, bh / H) };
+  }, [zoomFrac, gA, proj, W, H]);
 
   // submuestreo del DIBUJO (no del calculo) para no petar el SVG con vueltas largas
   const MAXDRAW = 900;
@@ -363,29 +376,38 @@ function GPSMap({ gA, gB, colors, cursor, onPick, W = 560, H = 380, interactive 
     const y = ((e.clientY - rect.top) / rect.height) * H;
     let best = 0, bd = Infinity;
     ptsA.forEach((p, i) => { const dd = (p.x - x) ** 2 + (p.y - y) ** 2; if (dd < bd) { bd = dd; best = i; } });
-    onPick(draw.idx[best] / (gA.seg.length - 1));
+    onPick(gA.distN[draw.idx[best]]);   // fraccion de DISTANCIA (igual que las graficas)
   }, [interactive, onPick, ptsA, draw, gA, W, H]);
 
-  const cur = cursor != null ? proj(gA.seg[clamp(Math.round(cursor * (gA.seg.length - 1)), 0, gA.seg.length - 1)]) : null;
+  // posicion del cursor: punto de la traza a distancia normalizada = cursor
+  const cur = useMemo(() => {
+    if (cursor == null) return null;
+    const dn = gA.distN, n = dn.length;
+    let lo = 0, hi = n - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (dn[m] < cursor) lo = m; else hi = m; }
+    const p0 = proj(gA.seg[lo]), p1 = proj(gA.seg[hi]);
+    const tt = (cursor - dn[lo]) / (dn[hi] - dn[lo] || 1);
+    return { x: p0.x + tt * (p1.x - p0.x), y: p0.y + tt * (p1.y - p0.y) };
+  }, [cursor, gA, proj]);
 
   return (
-    <svg ref={svgRef} viewBox={`0 0 ${W} ${H}`} width="100%" onClick={handleClick}
+    <svg ref={svgRef} viewBox={vb.box} width="100%" onClick={handleClick}
       style={{ cursor: interactive ? "crosshair" : "default", background: C.bg, borderRadius: 8, touchAction: "manipulation", height: heightCss || "auto", display: "block" }}>
-      {ptsB && <polyline fill="none" stroke={C.B} strokeOpacity="0.35" strokeWidth="2"
+      {ptsB && <polyline fill="none" stroke={C.B} strokeOpacity="0.35" strokeWidth="2" vectorEffect="non-scaling-stroke"
         points={ptsB.map((p) => `${p.x},${p.y}`).join(" ")} />}
       {draw.cols
         ? ptsA.slice(1).map((p, i) => (
-            <line key={i} x1={ptsA[i].x} y1={ptsA[i].y} x2={p.x} y2={p.y}
+            <line key={i} x1={ptsA[i].x} y1={ptsA[i].y} x2={p.x} y2={p.y} vectorEffect="non-scaling-stroke"
               stroke={draw.cols[i + 1] || C.dim} strokeWidth="3.5" strokeLinecap="round" />))
-        : <polyline fill="none" stroke={C.A} strokeWidth="3" points={ptsA.map((p) => `${p.x},${p.y}`).join(" ")} />}
+        : <polyline fill="none" stroke={C.A} strokeWidth="3" vectorEffect="non-scaling-stroke" points={ptsA.map((p) => `${p.x},${p.y}`).join(" ")} />}
       {splitPts.map((p, i) => p && (
         <g key={i}>
-          <circle cx={p.x} cy={p.y} r="7" fill="none" stroke={C.best} strokeWidth="2.5" />
-          <text x={p.x} y={p.y - 11} fill={C.best} fontSize="12" fontFamily="monospace" textAnchor="middle">S{i + 2}</text>
+          <circle cx={p.x} cy={p.y} r={7 * vb.k} fill="none" stroke={C.best} strokeWidth="2.5" vectorEffect="non-scaling-stroke" />
+          <text x={p.x} y={p.y - 11 * vb.k} fill={C.best} fontSize={12 * vb.k} fontFamily="monospace" textAnchor="middle">S{i + 2}</text>
         </g>
       ))}
-      {cur && <circle cx={cur.x} cy={cur.y} r="6" fill={C.text} stroke={C.bg} strokeWidth="2" />}
-      {ptsA[0] && <circle cx={ptsA[0].x} cy={ptsA[0].y} r="4" fill={C.best} />}
+      {cur && <circle cx={cur.x} cy={cur.y} r={6 * vb.k} fill={C.text} stroke={C.bg} strokeWidth="2" vectorEffect="non-scaling-stroke" />}
+      {ptsA[0] && <circle cx={ptsA[0].x} cy={ptsA[0].y} r={4 * vb.k} fill={C.best} />}
     </svg>
   );
 }
@@ -472,7 +494,14 @@ function GGDiagram({ gA, cal, cursor, smooth }) {
     return { pts, vlo, vhi };
   }, [gA, cal, smooth]);
   const lim = 2.5;
-  const curPt = cursor != null && pts.length ? pts[clamp(Math.round(cursor * (pts.length - 1)), 0, pts.length - 1)] : null;
+  const curPt = useMemo(() => {
+    if (cursor == null || !pts.length || !gA) return null;
+    const dn = gA.distN; let lo = 0, hi = dn.length - 1;
+    while (hi - lo > 1) { const m = (lo + hi) >> 1; if (dn[m] < cursor) lo = m; else hi = m; }
+    let best = pts[0], bd = Infinity;
+    for (const p of pts) { const d = Math.abs(p.i - lo); if (d < bd) { bd = d; best = p; } }
+    return best;
+  }, [cursor, pts, gA]);
   return (
     <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 10 }}>
       <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>DIAGRAMA G-G · color = velocidad</div>
@@ -760,6 +789,14 @@ function App() {
   const mapColors = mapData.colors;
   const mapLegend = mapData.legend;
 
+  // tramo de zoom (de las graficas) convertido a fraccion de distancia, para ampliar el mapa
+  const zoomFrac = useMemo(() => {
+    if (!xZoom || !gA) return null;
+    const [a, b] = xZoom;
+    if (xMode === "time") return [interp(gA.trel, gA.distN, a), interp(gA.trel, gA.distN, b)];
+    return [a / gA.total, b / gA.total];
+  }, [xZoom, xMode, gA]);
+
   useEffect(() => { try { localStorage.setItem("paddock_splits", JSON.stringify(splits)); } catch (e) {} }, [splits]);
 
   // stats A/B, sectores y vuelta ideal
@@ -939,8 +976,8 @@ function App() {
       </div>
       <div style={{ display: "flex", flexDirection: "column", gap: 12, position: "sticky", top: 12 }}>
         <div style={{ background: C.panel, border: `1px solid ${C.line}`, borderRadius: 8, padding: 8 }}>
-          <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>MAPA · {mapLegend?.title || ""}</div>
-          <GPSMap gA={gA} gB={gB} colors={mapColors} cursor={cursor} interactive={false} W={280} H={200} />
+          <div style={{ fontSize: 11, color: C.dim, fontFamily: "monospace", letterSpacing: 1, marginBottom: 4 }}>MAPA · {mapLegend?.title || ""}{zoomFrac ? " · zoom" : ""}</div>
+          <GPSMap gA={gA} gB={gB} colors={mapColors} cursor={cursor} interactive={false} W={280} H={200} zoomFrac={zoomFrac} />
           <div style={{ marginTop: 6 }}><MapLegend legend={mapLegend} /></div>
         </div>
         <GGDiagram gA={gA} cal={cal} cursor={cursor} smooth={smooth} />
